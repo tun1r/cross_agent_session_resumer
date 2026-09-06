@@ -383,6 +383,32 @@ impl OpenCode {
             .map(|err| err.to_string())
     }
 
+    /// Refuse when `conn` carries a live (event-sourced) OpenCode schema that
+    /// casr must not graft rows into: 1.x rows are projections of an event
+    /// log, and 2.x rows join `project` via foreign key inside an app-owned
+    /// `seq`-ordered message log, so rows inserted behind the app's back
+    /// would not be picked up and would leave the DB with disagreeing state.
+    /// Databases matching no known schema fall through to the legacy writer
+    /// path exactly as before.
+    fn refuse_live_schema(conn: &Connection, db_path: &Path) -> anyhow::Result<()> {
+        let Ok(schema) = Self::detect_schema(conn, db_path) else {
+            return Ok(());
+        };
+        let tables = match schema {
+            DbSchema::Legacy => return Ok(()),
+            DbSchema::V1 => "session/message/part",
+            DbSchema::V2 => "session_v2/session_message",
+        };
+        anyhow::bail!(
+            "OpenCode DB {} uses the {} live schema ({}); \
+             casr can read it but does not write into it. Point OPENCODE_DB_PATH at a \
+             separate database, or use a different target provider.",
+            db_path.display(),
+            schema.label(),
+            tables,
+        )
+    }
+
     /// Pull a column by name, tolerating columns absent in older or newer
     /// OpenCode 1.x revisions (returns `None` instead of failing the row).
     fn col<T: rusqlite::types::FromSql>(row: &rusqlite::Row<'_>, name: &str) -> Option<T> {
@@ -738,8 +764,9 @@ CREATE INDEX IF NOT EXISTS idx_files_session_id ON files (session_id);
     /// `session_v2` carries one row per session; `session_message` carries one
     /// row per message ordered by `seq`, each with a `type` discriminator and
     /// a `data` JSON blob. Types map to canonical roles as follows:
-    /// `user` / `assistant` / `system` directly; `synthetic` (agent-generated
-    /// tool narratives) and `shell` (command plus output) become `Tool`
+    /// `user` / `assistant` / `system` directly (user `files` attachments
+    /// render as short `[attachment: …]` markers); `synthetic` (agent-generated
+    /// tool narratives) and `shell` (command plus captured output) become `Tool`
     /// messages; `compaction` auto-summaries become `System` context so the
     /// receiving agent keeps the condensed history. `model-switched`,
     /// `agent-switched` and `location-switched` carry no conversational
@@ -844,12 +871,18 @@ CREATE INDEX IF NOT EXISTS idx_files_session_id ON files (session_id);
                         // Agent-generated tool narratives read as tool output.
                         _ => MessageRole::Tool,
                     };
-                    let content = data
+                    let mut content = data
                         .get("text")
                         .and_then(serde_json::Value::as_str)
                         .map(ToString::to_string)
                         .filter(|text| !text.trim().is_empty())
                         .unwrap_or_else(|| flatten_content(&data));
+                    for marker in v2_attachment_markers(&data) {
+                        if !content.is_empty() {
+                            content.push('\n');
+                        }
+                        content.push_str(&marker);
+                    }
                     (role, content, Vec::new(), Vec::new())
                 }
                 "assistant" => {
@@ -897,8 +930,7 @@ CREATE INDEX IF NOT EXISTS idx_files_session_id ON files (session_id);
                         .unwrap_or("unknown");
                     let output = data
                         .get("output")
-                        .map(flatten_content)
-                        .filter(|output| !output.trim().is_empty())
+                        .and_then(v2_shell_output_text)
                         .map_or_else(String::new, |output| format!("\n{output}"));
                     (
                         MessageRole::Tool,
@@ -952,7 +984,7 @@ CREATE INDEX IF NOT EXISTS idx_files_session_id ON files (session_id);
                 extra: serde_json::json!({
                     "opencode_message_id": message_id,
                     "opencode_message_type": message_type,
-                    "opencode_message": data,
+                    "opencode_message": elide_long_strings(&data),
                 }),
             });
         }
@@ -1268,30 +1300,22 @@ impl Provider for OpenCode {
         opts: &WriteOptions,
     ) -> anyhow::Result<WrittenSession> {
         let db_path = Self::choose_target_db_path(session)?;
+
+        // Probe the target with a read-only connection FIRST. Opening a live
+        // WAL-mode database read-write — even just to detect-and-refuse it —
+        // creates/attaches `-wal`/`-shm` and can checkpoint the WAL into the
+        // main file on close, mutating a database casr must never touch.
+        if db_path.is_file() {
+            let probe = Self::open_db(&db_path)?;
+            Self::refuse_live_schema(&probe, &db_path)?;
+        }
+
         let mut conn = Self::open_db_rw(&db_path)?;
 
-        // Never graft rows into a live OpenCode 1.x/2.x DB: 1.x rows are
-        // projections of an event log, and 2.x rows join `project` via
-        // foreign key inside an app-owned `seq`-ordered message log, so rows
-        // inserted behind the app's back would not be picked up and would
-        // leave the DB with disagreeing state.
-        if let Ok(schema) = Self::detect_schema(&conn, &db_path) {
-            let tables = match schema {
-                DbSchema::Legacy => None,
-                DbSchema::V1 => Some("session/message/part"),
-                DbSchema::V2 => Some("session_v2/session_message"),
-            };
-            if let Some(tables) = tables {
-                anyhow::bail!(
-                    "OpenCode DB {} uses the {} live schema ({}); \
-                     casr can read it but does not write into it. Point OPENCODE_DB_PATH at a \
-                     separate database, or use a different target provider.",
-                    db_path.display(),
-                    schema.label(),
-                    tables,
-                );
-            }
-        }
+        // Belt-and-braces re-check on the read-write connection: the schema
+        // could have changed (or the file been replaced) between probe and
+        // open.
+        Self::refuse_live_schema(&conn, &db_path)?;
         Self::ensure_schema(&conn)?;
 
         let has_count_trigger =
@@ -1892,6 +1916,84 @@ fn parse_v2_content(parts: &serde_json::Value) -> (String, Vec<ToolCall>, Vec<To
     }
 
     (content, tool_calls, tool_results)
+}
+
+/// Extract the captured text of an OpenCode 2.x `shell` message `output`.
+///
+/// Beta revisions nest the terminal text one level deep
+/// (`{"output":"…","cursor":…,"size":…,"truncated":…}`); other shapes are a
+/// plain string or content blocks. Returns `None` when nothing readable
+/// remains.
+fn v2_shell_output_text(value: &serde_json::Value) -> Option<String> {
+    let text = match value {
+        serde_json::Value::Object(object) => object
+            .get("output")
+            .and_then(serde_json::Value::as_str)
+            .map(ToString::to_string)
+            .unwrap_or_else(|| flatten_content(value)),
+        _ => flatten_content(value),
+    };
+    (!text.trim().is_empty()).then_some(text)
+}
+
+/// Short `[attachment: …]` markers for the files attached to an OpenCode 2.x
+/// user message, so pasted images/PDFs stay visible in the canonical IR the
+/// way 1.x `file` parts do — without carrying their (potentially megabyte)
+/// base64 payloads.
+fn v2_attachment_markers(data: &serde_json::Value) -> Vec<String> {
+    data.get("files")
+        .and_then(serde_json::Value::as_array)
+        .map(|files| {
+            files
+                .iter()
+                .map(|file| {
+                    let label = file
+                        .get("name")
+                        .or_else(|| file.get("filename"))
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|name| !name.trim().is_empty())
+                        .map_or_else(
+                            || {
+                                file.get("mime")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or("file")
+                                    .to_string()
+                            },
+                            ToString::to_string,
+                        );
+                    format!("[attachment: {label}]")
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Longest string value kept verbatim inside `extra.opencode_message`.
+const EXTRA_STRING_ELISION_LIMIT: usize = 8 * 1024;
+
+/// Copy a raw OpenCode 2.x message blob for `extra` storage, replacing
+/// oversized string values (base64 attachments, giant tool dumps) with short
+/// elision markers. The blob's structure is preserved; the duplicated bulk —
+/// already represented by the canonical content — is not.
+fn elide_long_strings(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(text) => {
+            if text.len() > EXTRA_STRING_ELISION_LIMIT {
+                serde_json::Value::from(format!("<elided {} bytes>", text.len()))
+            } else {
+                value.clone()
+            }
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(elide_long_strings).collect())
+        }
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.iter()
+                .map(|(key, value)| (key.clone(), elide_long_strings(value)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
 }
 
 /// Render the outcome text of an OpenCode 2.x tool `state` object.
@@ -3379,7 +3481,7 @@ INSERT INTO session (id, title, time_created) VALUES ('ses_partial', 'partial', 
                 "m6",
                 "shell",
                 6,
-                r#"{"command":"ls","status":"exited","output":"a\nb"}"#,
+                r#"{"command":"ls","status":"exited","exit":0,"output":{"output":"a\nb","cursor":3,"size":3,"truncated":false}}"#,
             ),
             ("m7", "model-switched", 7, r#"{"model":{"id":"other"}}"#),
             ("m8", "future-type", 8, r#"{"text":"from the future"}"#),
@@ -3402,6 +3504,26 @@ INSERT INTO session (id, title, time_created) VALUES ('ses_partial', 'partial', 
             )
             .expect("fixture message");
         }
+
+        // A user turn carrying pasted-file attachments: the payload is far
+        // larger than the extras elision limit, exercising both the
+        // `[attachment: …]` markers and the oversized-string guard.
+        let big_payload = "A".repeat(20_000);
+        let attached_user = serde_json::json!({
+            "text": "",
+            "time": {"created": 1_700_000_001_100_i64},
+            "files": [
+                {"mime": "image/png", "data": big_payload},
+                {"mime": "application/pdf", "data": "JVBERi0xLjQ="},
+            ],
+        });
+        conn.execute(
+            "INSERT INTO session_message
+                (id, session_id, type, seq, time_created, time_updated, data)
+             VALUES ('m11', 'ses_v2_root', 'user', 11, 1700000000000, 1700000000000, ?1)",
+            rusqlite::params![serde_json::to_string(&attached_user).expect("serialize")],
+        )
+        .expect("fixture attached user message");
         drop(conn);
         db_path
     }
@@ -3468,8 +3590,9 @@ INSERT INTO session (id, title, time_created) VALUES ('ses_partial', 'partial', 
         assert!(session.started_at.is_some());
         assert!(session.ended_at.is_some());
 
-        // m7 (bookkeeping) and m9 (malformed blob) are skipped.
-        assert_eq!(session.messages.len(), 8);
+        // m7 (bookkeeping) and m9 (malformed blob) are skipped; m11 (the
+        // attached user turn) is appended after m10.
+        assert_eq!(session.messages.len(), 9);
 
         assert_eq!(session.messages[0].role, MessageRole::User);
         assert_eq!(session.messages[0].content, "Fix the login bug");
@@ -3519,6 +3642,11 @@ INSERT INTO session (id, title, time_created) VALUES ('ses_partial', 'partial', 
             "shell command and status are preserved: {}",
             session.messages[5].content
         );
+        assert!(
+            session.messages[5].content.contains("a\nb"),
+            "nested shell output text is rendered: {}",
+            session.messages[5].content
+        );
 
         assert_eq!(
             session.messages[6].role,
@@ -3535,6 +3663,32 @@ INSERT INTO session (id, title, time_created) VALUES ('ses_partial', 'partial', 
         assert_eq!(
             failed.content, "disk full",
             "content falls back to result text when no text/reasoning exists"
+        );
+
+        let attached = &session.messages[8];
+        assert_eq!(attached.role, MessageRole::User);
+        assert!(
+            attached.content.contains("[attachment: image/png]")
+                && attached.content.contains("[attachment: application/pdf]"),
+            "attachment markers are rendered: {}",
+            attached.content
+        );
+        assert!(
+            !attached.content.contains("AAAA"),
+            "base64 payloads must not leak into content: {}",
+            attached.content
+        );
+        let extra_blob = &attached.extra["opencode_message"];
+        assert!(
+            extra_blob["files"][0]["data"]
+                .as_str()
+                .is_some_and(|data| data.starts_with("<elided")),
+            "oversized payloads are elided in extras: {extra_blob}"
+        );
+        assert_eq!(
+            extra_blob["files"][1]["data"],
+            serde_json::json!("JVBERi0xLjQ="),
+            "payloads under the limit stay verbatim"
         );
     }
 
@@ -3581,6 +3735,7 @@ INSERT INTO session (id, title, time_created) VALUES ('ses_partial', 'partial', 
         let db_path = v2_fixture_db(tmp.path());
         assert_eq!(db_path.parent().and_then(|p| p.parent()), Some(tmp.path()));
         let source = sample_session(tmp.path());
+        let before = std::fs::read(&db_path).expect("snapshot fixture db bytes");
 
         let err = OpenCode
             .write_session(&source, &WriteOptions { force: false })
@@ -3590,7 +3745,14 @@ INSERT INTO session (id, title, time_created) VALUES ('ses_partial', 'partial', 
             "refusal should name the 2.x schema: {err}"
         );
 
-        // The fixture DB is untouched: no legacy tables grafted in.
+        // The fixture DB is untouched: no legacy tables grafted in, and the
+        // file is byte-identical (a read-only probe must be used before any
+        // read-write open, so a live WAL-mode DB is never checkpointed).
+        assert_eq!(
+            before,
+            std::fs::read(&db_path).expect("reread fixture db"),
+            "refused write must not modify the live DB file"
+        );
         let conn = OpenCode::open_db(&db_path).expect("open db");
         assert!(
             !OpenCode::table_exists(&conn, "sessions"),
