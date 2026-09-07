@@ -9,6 +9,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use anyhow::Context;
 use tracing::{debug, info, warn};
 
 use crate::discovery::{ProviderRegistry, SourceHint};
@@ -326,12 +327,123 @@ fn message_role_label(role: &MessageRole) -> String {
 // ---------------------------------------------------------------------------
 
 impl ConversionPipeline {
+    /// Convert a source session and all of its descendants in parent-first
+    /// order. The source provider must expose an efficient session listing;
+    /// providers without one retain the existing single-session behavior.
+    pub fn convert_tree(
+        &self,
+        target_alias: &str,
+        root_session_id: &str,
+        mut opts: ConvertOptions,
+    ) -> anyhow::Result<Vec<ConversionResult>> {
+        let source_hint = opts.source_hint.as_deref().map(SourceHint::parse);
+        let root = self
+            .registry
+            .resolve_session(root_session_id, source_hint.as_ref())?;
+        let source_provider = root.provider;
+        let listed = source_provider.list_sessions().ok_or_else(|| {
+            anyhow::anyhow!(
+                "source provider '{}' cannot enumerate sessions for hierarchy conversion",
+                source_provider.slug()
+            )
+        })?;
+
+        let mut paths = std::collections::HashMap::new();
+        let mut parents = std::collections::HashMap::new();
+        for (session_id, path) in listed {
+            let canonical = source_provider.read_session(&path).with_context(|| {
+                format!(
+                    "failed to read '{}' while building session hierarchy",
+                    path.display()
+                )
+            })?;
+            let parent = canonical
+                .metadata
+                .get("parent_session_id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|parent| !parent.is_empty())
+                .map(ToString::to_string);
+            paths.insert(session_id.clone(), path);
+            parents.insert(session_id, parent);
+        }
+        if !paths.contains_key(root_session_id) {
+            paths.insert(root_session_id.to_string(), root.path.clone());
+            parents.insert(root_session_id.to_string(), None);
+        }
+
+        let mut selected = vec![root_session_id.to_string()];
+        let mut visited = std::collections::HashSet::from([root_session_id.to_string()]);
+        let mut cursor = 0;
+        while cursor < selected.len() {
+            let parent = &selected[cursor];
+            let mut children: Vec<String> = parents
+                .iter()
+                .filter_map(|(session_id, candidate)| {
+                    (candidate.as_deref() == Some(parent.as_str())).then_some(session_id.clone())
+                })
+                .collect();
+            children.sort();
+            for child in &children {
+                anyhow::ensure!(
+                    visited.insert(child.clone()),
+                    "cycle in source session hierarchy at {child}"
+                );
+            }
+            selected.extend(children);
+            cursor += 1;
+        }
+
+        // Resolve all children through the same provider even when the caller
+        // did not supply --source, avoiding cross-provider ID ambiguity.
+        opts.source_hint = Some(source_provider.cli_alias().to_string());
+        let mut target_ids = std::collections::HashMap::new();
+        let mut results = Vec::with_capacity(selected.len());
+        for source_id in selected {
+            // Use the path already resolved while enumerating the tree. Native
+            // child IDs may be local to a parent rather than globally unique.
+            opts.source_hint = paths.get(&source_id).map(|path| path.display().to_string());
+            let parent_target = parents
+                .get(&source_id)
+                .and_then(Option::as_deref)
+                .and_then(|parent| target_ids.get(parent).map(String::as_str));
+            let result =
+                self.convert_with_parent(target_alias, &source_id, opts.clone(), parent_target)?;
+            if let Some(written) = &result.written {
+                target_ids.insert(source_id, written.session_id.clone());
+            }
+            results.push(result);
+        }
+        Ok(results)
+    }
+
     /// Run the full detect → read → validate → write → verify pipeline.
     pub fn convert(
         &self,
         target_alias: &str,
         session_id: &str,
         opts: ConvertOptions,
+    ) -> anyhow::Result<ConversionResult> {
+        self.convert_internal(target_alias, session_id, opts, None)
+    }
+
+    /// Convert one session while attaching it to an already-written target
+    /// parent when the target provider supports native hierarchy.
+    pub fn convert_with_parent(
+        &self,
+        target_alias: &str,
+        session_id: &str,
+        opts: ConvertOptions,
+        parent_target_session_id: Option<&str>,
+    ) -> anyhow::Result<ConversionResult> {
+        self.convert_internal(target_alias, session_id, opts, parent_target_session_id)
+    }
+
+    fn convert_internal(
+        &self,
+        target_alias: &str,
+        session_id: &str,
+        opts: ConvertOptions,
+        parent_target_session_id: Option<&str>,
     ) -> anyhow::Result<ConversionResult> {
         // 1. Resolve target provider.
         let target_provider = self.registry.find_by_alias(target_alias).ok_or_else(|| {
@@ -511,6 +623,8 @@ session unless your cwd matches the written workspace."
         );
         all_warnings.extend(budget_warnings);
 
+        all_warnings.extend(target_provider.prepare_session(&mut canonical)?);
+
         // 7b. Normalize tool-only messages with empty content.
         //
         // Some source formats (notably Codex with `originator: codex_exec`)
@@ -529,7 +643,10 @@ session unless your cwd matches the written workspace."
         // a synthesized text block there would corrupt the round-trip and cause
         // the Anthropic API to reject the replayed history alongside the
         // matching `tool_result`.
-        let target_preserves_tool_blocks = target_provider.slug() == "claude-code";
+        let target_preserves_tool_blocks = matches!(
+            target_provider.slug(),
+            "claude-code" | "opencode-v1" | "opencode-v2"
+        );
         if !target_preserves_tool_blocks {
             for msg in &mut canonical.messages {
                 if !msg.content.trim().is_empty() {
@@ -567,7 +684,11 @@ session unless your cwd matches the written workspace."
 
         // 8. Write to target provider.
         let write_opts = WriteOptions { force: opts.force };
-        let written = target_provider.write_session(&canonical, &write_opts)?;
+        let written = target_provider.write_session_with_parent(
+            &canonical,
+            &write_opts,
+            parent_target_session_id,
+        )?;
         info!(
             target_session_id = written.session_id,
             resume_command = written.resume_command,
@@ -845,6 +966,18 @@ fn rollback_written_session(
     provider_slug: &str,
     written: &WrittenSession,
 ) -> Result<(), CasrError> {
+    // Native OpenCode imports live inside a database OpenCode owns. Deleting
+    // rows from it would be a destructive mutation of another tool's store,
+    // so a failed verification leaves them in place and says so.
+    if matches!(provider_slug, "opencode-v1" | "opencode-v2") {
+        warn!(
+            provider_slug,
+            session_id = %written.session_id,
+            "leaving natively imported OpenCode rows in place after verification failure"
+        );
+        return Ok(());
+    }
+
     let target_path = written.paths.first().cloned();
     if let Some(path) = &target_path
         && let Some(backup_path) = &written.backup_path

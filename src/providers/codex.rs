@@ -246,6 +246,15 @@ impl Provider for Codex {
         session: &CanonicalSession,
         opts: &WriteOptions,
     ) -> anyhow::Result<WrittenSession> {
+        self.write_session_with_parent(session, opts, None)
+    }
+
+    fn write_session_with_parent(
+        &self,
+        session: &CanonicalSession,
+        opts: &WriteOptions,
+        parent_session_id: Option<&str>,
+    ) -> anyhow::Result<WrittenSession> {
         let target_session_id = uuid::Uuid::new_v4().to_string();
         let now = chrono::Utc::now();
 
@@ -272,6 +281,28 @@ impl Provider for Codex {
         // `timestamp` as an RFC3339 *string* (not a numeric epoch). Emit the
         // string form both at the envelope level and inside the payload.
         let now_iso = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let child_depth =
+            parent_session_id.map(|parent_id| Self::spawn_depth(parent_id).unwrap_or(0) + 1);
+        let source = parent_session_id
+            .map(|parent_id| {
+                serde_json::json!({
+                    "subagent": {
+                        "thread_spawn": {
+                            "parent_thread_id": parent_id,
+                            "depth": child_depth.unwrap_or(1),
+                            "agent_path": null,
+                            "agent_nickname": null,
+                            "agent_role": null
+                        }
+                    }
+                })
+            })
+            .unwrap_or_else(|| serde_json::json!("cli"));
+        let thread_source = if parent_session_id.is_some() {
+            "subagent"
+        } else {
+            "user"
+        };
         lines.push(serde_json::to_string(&serde_json::json!({
             "type": "session_meta",
             "timestamp": now_iso,
@@ -284,8 +315,9 @@ impl Provider for Codex {
                 "timestamp": now_iso,
                 "originator": "casr",
                 "cli_version": env!("CARGO_PKG_VERSION"),
-                "source": "cli",
-                "thread_source": "user",
+                "parent_thread_id": parent_session_id,
+                "source": source,
+                "thread_source": thread_source,
                 "model_provider": "openai",
             }
         }))?);
@@ -343,7 +375,7 @@ impl Provider for Codex {
         } else {
             first_user_message.clone()
         };
-        let warnings = Self::register_thread(
+        let mut warnings = Self::register_thread(
             &target_session_id,
             &outcome.target_path,
             &cwd,
@@ -351,7 +383,17 @@ impl Provider for Codex {
             &first_user_message,
             &preview,
             &now,
+            parent_session_id,
+            child_depth,
         );
+
+        if let Some(parent_id) = parent_session_id
+            && let Err(error) = Self::register_spawn_edge(parent_id, &target_session_id)
+        {
+            warnings.push(format!(
+                "Could not attach Codex child thread {target_session_id} to parent {parent_id}: {error}"
+            ));
+        }
 
         Ok(WrittenSession {
             paths: vec![outcome.target_path],
@@ -386,6 +428,32 @@ impl Provider for Codex {
 // ---------------------------------------------------------------------------
 
 impl Codex {
+    /// Return the number of persisted spawn ancestors for a Codex thread.
+    ///
+    /// The parent is written before its children during tree conversion, so
+    /// this lets nested imports carry the same depth Codex writes natively.
+    fn spawn_depth(thread_id: &str) -> Option<i64> {
+        let db_path = Self::latest_state_db()?;
+        let conn = Connection::open_with_flags(
+            db_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .ok()?;
+        conn.query_row(
+            "WITH RECURSIVE lineage(id, depth) AS (
+                 SELECT ?1, 0
+                 UNION ALL
+                 SELECT edge.parent_thread_id, lineage.depth + 1
+                 FROM thread_spawn_edges edge
+                 JOIN lineage ON edge.child_thread_id = lineage.id
+             )
+             SELECT MAX(depth) FROM lineage",
+            [thread_id],
+            |row| row.get(0),
+        )
+        .ok()
+    }
+
     /// Locate the newest Codex thread-index database under `CODEX_HOME`/`~/.codex`.
     ///
     /// Matches `state.sqlite` and `state_<N>.sqlite`, preferring the highest
@@ -416,6 +484,10 @@ impl Codex {
     /// Returns any non-fatal warnings to surface to the user (empty on success).
     /// A rollout file that could not be registered is still on disk, so the
     /// warning includes that path as a fallback.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "maps the Codex thread index fields and hierarchy metadata"
+    )]
     fn register_thread(
         session_id: &str,
         rollout_path: &Path,
@@ -424,6 +496,8 @@ impl Codex {
         first_user_message: &str,
         preview: &str,
         now: &chrono::DateTime<chrono::Utc>,
+        parent_session_id: Option<&str>,
+        child_depth: Option<i64>,
     ) -> Vec<String> {
         let Some(db_path) = Self::latest_state_db() else {
             debug!("no Codex state_*.sqlite found; skipping thread registration");
@@ -444,6 +518,8 @@ impl Codex {
             first_user_message,
             preview,
             now,
+            parent_session_id,
+            child_depth,
         ) {
             Ok(()) => {
                 debug!(db = %db_path.display(), session_id, "registered Codex thread");
@@ -460,6 +536,52 @@ impl Codex {
                 )]
             }
         }
+    }
+
+    /// Register Codex's native parent/child relationship. Current Codex
+    /// stores this separately from the rollout and thread row in
+    /// `thread_spawn_edges`; a flat rollout file cannot represent it.
+    fn register_spawn_edge(parent_id: &str, child_id: &str) -> anyhow::Result<()> {
+        let db_path = Self::latest_state_db()
+            .ok_or_else(|| anyhow::anyhow!("Codex thread index not found"))?;
+        let conn = Connection::open_with_flags(
+            &db_path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .with_context(|| format!("open Codex state DB {}", db_path.display()))?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+
+        let has_table = conn
+            .prepare(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'thread_spawn_edges'",
+            )?
+            .exists([])?;
+        if !has_table {
+            anyhow::bail!("Codex database has no thread_spawn_edges table");
+        }
+
+        conn.execute(
+            "INSERT INTO thread_spawn_edges (parent_thread_id, child_thread_id, status)
+             VALUES (?1, ?2, 'closed')
+             ON CONFLICT(child_thread_id) DO UPDATE SET
+               parent_thread_id = excluded.parent_thread_id,
+               status = excluded.status",
+            rusqlite::params![parent_id, child_id],
+        )?;
+
+        let attached: bool = conn
+            .query_row(
+                "SELECT 1 FROM thread_spawn_edges
+                 WHERE parent_thread_id = ?1 AND child_thread_id = ?2",
+                rusqlite::params![parent_id, child_id],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if !attached {
+            anyhow::bail!("spawn edge verification failed");
+        }
+        Ok(())
     }
 }
 
@@ -614,6 +736,8 @@ fn register_thread_in_db(
     first_user_message: &str,
     preview: &str,
     now: &chrono::DateTime<chrono::Utc>,
+    parent_session_id: Option<&str>,
+    child_depth: Option<i64>,
 ) -> anyhow::Result<()> {
     let mut conn = Connection::open_with_flags(
         db_path,
@@ -643,6 +767,26 @@ fn register_thread_in_db(
 
     // Desired (column, value) pairs. Filtered to columns that actually exist so
     // the write is resilient across Codex schema versions.
+    let (source, thread_source) = if let Some(parent_id) = parent_session_id {
+        let source = serde_json::json!({
+            "subagent": {
+                "thread_spawn": {
+                    "parent_thread_id": parent_id,
+                    "depth": child_depth.unwrap_or(1),
+                    "agent_path": null,
+                    "agent_nickname": null,
+                    "agent_role": null
+                }
+            }
+        });
+        (
+            serde_json::to_string(&source).expect("Codex source metadata is serializable"),
+            "subagent",
+        )
+    } else {
+        (env.source, "user")
+    };
+
     let mut desired: Vec<(&str, Value)> = vec![
         ("id", Value::Text(session_id.to_string())),
         ("rollout_path", Value::Text(abs_str.clone())),
@@ -652,7 +796,7 @@ fn register_thread_in_db(
         ("updated_at_ms", Value::Integer(created_ms)),
         ("recency_at", Value::Integer(created)),
         ("recency_at_ms", Value::Integer(created_ms)),
-        ("source", Value::Text(env.source)),
+        ("source", Value::Text(source)),
         ("model_provider", Value::Text(env.model_provider)),
         ("cwd", Value::Text(cwd.to_string())),
         ("title", Value::Text(title.to_string())),
@@ -664,7 +808,7 @@ fn register_thread_in_db(
             Value::Text(first_user_message.to_string()),
         ),
         ("preview", Value::Text(preview.to_string())),
-        ("thread_source", Value::Text("user".to_string())),
+        ("thread_source", Value::Text(thread_source.to_string())),
         ("has_user_event", Value::Integer(1)),
         (
             "cli_version",
@@ -749,29 +893,23 @@ fn register_thread_in_db(
 /// `msg_ts` is the event timestamp as an RFC3339 string, matching the
 /// top-level `timestamp` format current Codex readers expect.
 fn codex_events_for_message(msg: &CanonicalMessage, msg_ts: &str) -> Vec<serde_json::Value> {
-    // User messages that carry tool payloads must be serialized as response_item
-    // envelopes; event_msg/user_message cannot represent tool_use/tool_result blocks.
-    let user_needs_response_item = msg.role == MessageRole::User
-        && (!msg.tool_calls.is_empty() || !msg.tool_results.is_empty());
+    let mut events: Vec<serde_json::Value> = Vec::new();
 
     match msg.role {
-        MessageRole::User if !user_needs_response_item => vec![serde_json::json!({
-            "type": "event_msg",
-            "timestamp": msg_ts,
-            "payload": {
-                "type": "user_message",
-                "message": msg.content,
+        MessageRole::User => {
+            if !msg.content.trim().is_empty() {
+                events.push(serde_json::json!({
+                    "type": "event_msg",
+                    "timestamp": msg_ts,
+                    "payload": {
+                        "type": "user_message",
+                        "message": msg.content,
+                    }
+                }));
             }
-        })],
-        MessageRole::User => vec![serde_json::json!({
-            "type": "response_item",
-            "timestamp": msg_ts,
-            "payload": {
-                "type": "message",
-                "role": codex_role_string(&msg.role),
-                "content": codex_response_content(msg),
-            }
-        })],
+            events.extend(codex_tool_items(msg, msg_ts));
+            events
+        }
         MessageRole::Assistant if msg.author.as_deref() == Some("reasoning") => {
             vec![serde_json::json!({
                 "type": "event_msg",
@@ -782,20 +920,37 @@ fn codex_events_for_message(msg: &CanonicalMessage, msg_ts: &str) -> Vec<serde_j
                 }
             })]
         }
-        MessageRole::Assistant
-        | MessageRole::Tool
-        | MessageRole::System
-        | MessageRole::Other(_) => {
-            let mut events = vec![serde_json::json!({
+        MessageRole::Assistant => {
+            if !msg.content.trim().is_empty() {
+                events.push(serde_json::json!({
+                    "type": "event_msg",
+                    "timestamp": msg_ts,
+                    "payload": {
+                        "type": "agent_message",
+                        "message": msg.content,
+                        "phase": "final_answer",
+                        "memory_citation": null,
+                    }
+                }));
+            }
+            // The message record anchors the turn so tool records reattach to
+            // it on read-back, even when the assistant text is empty.
+            events.push(serde_json::json!({
                 "type": "response_item",
                 "timestamp": msg_ts,
                 "payload": {
                     "type": "message",
-                    "role": codex_role_string(&msg.role),
-                    "content": codex_response_content(msg),
+                    "id": format!("msg_{}", uuid::Uuid::new_v4()),
+                    "role": "assistant",
+                    "phase": "final_answer",
+                    "content": if msg.content.trim().is_empty() {
+                        serde_json::json!([])
+                    } else {
+                        codex_text_content(&msg.content, "output_text")
+                    },
                 }
-            })];
-
+            }));
+            events.extend(codex_tool_items(msg, msg_ts));
             if let Some(info) = codex_token_count_info(&msg.extra) {
                 events.push(serde_json::json!({
                     "type": "event_msg",
@@ -806,10 +961,88 @@ fn codex_events_for_message(msg: &CanonicalMessage, msg_ts: &str) -> Vec<serde_j
                     }
                 }));
             }
-
             events
         }
+        MessageRole::Tool => {
+            let mut items = codex_tool_items(msg, msg_ts);
+            if items.is_empty() && !msg.content.trim().is_empty() {
+                items.push(serde_json::json!({
+                    "type": "response_item",
+                    "timestamp": msg_ts,
+                    "payload": {
+                        "type": "function_call_output",
+                        "call_id": "",
+                        "output": msg.content,
+                    }
+                }));
+            }
+            items
+        }
+        MessageRole::System | MessageRole::Other(_) => {
+            vec![serde_json::json!({
+                "type": "response_item",
+                "timestamp": msg_ts,
+                "payload": {
+                    "type": "message",
+                    "role": codex_role_string(&msg.role),
+                    "content": codex_text_content(&msg.content, "input_text"),
+                }
+            })]
+        }
     }
+}
+
+/// Native tool records for one canonical message: `function_call` items for
+/// calls and `function_call_output` items for results. Codex message content
+/// blocks cannot carry tool payloads, so they live in their own records.
+fn codex_tool_items(msg: &CanonicalMessage, msg_ts: &str) -> Vec<serde_json::Value> {
+    let mut items: Vec<serde_json::Value> =
+        Vec::with_capacity(msg.tool_calls.len() + msg.tool_results.len());
+
+    for call in &msg.tool_calls {
+        let call_id = call
+            .id
+            .clone()
+            .unwrap_or_else(|| format!("call_{}", uuid::Uuid::new_v4()));
+        items.push(serde_json::json!({
+            "type": "response_item",
+            "timestamp": msg_ts,
+            "payload": {
+                "type": "function_call",
+                "id": format!("fc_{}", uuid::Uuid::new_v4()),
+                "call_id": call_id,
+                "name": call.name,
+                "arguments": call.arguments.to_string(),
+            }
+        }));
+    }
+
+    for result in &msg.tool_results {
+        // Some sources keep the result text only on the message; never emit
+        // an empty native output record for them.
+        let output = if result.content.trim().is_empty() {
+            msg.content.clone()
+        } else {
+            result.content.clone()
+        };
+        items.push(serde_json::json!({
+            "type": "response_item",
+            "timestamp": msg_ts,
+            "payload": {
+                "type": "function_call_output",
+                "call_id": result.call_id.clone().unwrap_or_default(),
+                "output": output,
+            }
+        }));
+    }
+
+    items
+}
+
+/// Single-block message content. Codex message records only accept
+/// `input_text` / `output_text` blocks; anything else fails deserialization.
+fn codex_text_content(text: &str, block_type: &str) -> serde_json::Value {
+    serde_json::json!([{ "type": block_type, "text": text }])
 }
 
 fn codex_role_string(role: &MessageRole) -> String {
@@ -820,53 +1053,6 @@ fn codex_role_string(role: &MessageRole) -> String {
         MessageRole::System => "developer".to_string(),
         MessageRole::Other(other) => other.clone(),
     }
-}
-
-fn codex_response_content(msg: &CanonicalMessage) -> serde_json::Value {
-    let mut blocks: Vec<serde_json::Value> = Vec::new();
-
-    // Codex expects "output_text" for assistant-generated content blocks,
-    // "input_text" for user-supplied content blocks.
-    let text_type = if msg.role == MessageRole::Assistant {
-        "output_text"
-    } else {
-        "input_text"
-    };
-
-    if !msg.content.is_empty() {
-        blocks.push(serde_json::json!({
-            "type": text_type,
-            "text": msg.content,
-        }));
-    }
-
-    for tc in &msg.tool_calls {
-        blocks.push(serde_json::json!({
-            "type": "tool_use",
-            "id": tc.id.as_deref().unwrap_or(""),
-            "name": tc.name,
-            "input": tc.arguments,
-        }));
-    }
-
-    for tr in &msg.tool_results {
-        blocks.push(serde_json::json!({
-            "type": "tool_result",
-            "tool_use_id": tr.call_id.as_deref().unwrap_or(""),
-            "content": tr.content,
-            "is_error": tr.is_error,
-        }));
-    }
-
-    // Avoid empty response payloads in provider-native output.
-    if blocks.is_empty() {
-        blocks.push(serde_json::json!({
-            "type": text_type,
-            "text": msg.content,
-        }));
-    }
-
-    serde_json::Value::Array(blocks)
 }
 
 fn codex_token_count_info(extra: &serde_json::Value) -> Option<serde_json::Value> {
@@ -996,19 +1182,92 @@ impl Codex {
                 }
                 "response_item" => {
                     if let Some(p) = payload {
-                        // `function_call_output` / `custom_tool_call_output` events
-                        // carry no `role` field and would otherwise default to
-                        // "assistant". The Anthropic API (and Claude Code resume)
-                        // require tool results to live in *user* turns, so we
-                        // classify them as Tool — target writers map Tool → user side.
+                        // `function_call` / `function_call_output` events carry no
+                        // `role` field and would otherwise default to "assistant".
+                        // The Anthropic API (and Claude Code resume) require tool
+                        // results to live in *user* turns, so unowned results are
+                        // classified as Tool — target writers map Tool → user side.
                         let payload_type =
                             p.get("type").and_then(|v| v.as_str()).unwrap_or_default();
-                        let role = if matches!(
+
+                        // Native tool records reattach to their owning turn:
+                        // calls merge into the preceding assistant message, and
+                        // results merge into the message that owns the call (or
+                        // into a user message, matching Claude-style results).
+                        if matches!(payload_type, "function_call" | "custom_tool_call") {
+                            let calls = codex_extract_payload_tool_calls(p);
+                            if !calls.is_empty() {
+                                match messages.last_mut() {
+                                    Some(last) if last.role == MessageRole::Assistant => {
+                                        last.tool_calls.extend(calls);
+                                    }
+                                    _ => messages.push(CanonicalMessage {
+                                        idx: 0,
+                                        role: MessageRole::Assistant,
+                                        content: String::new(),
+                                        timestamp: ts,
+                                        author: None,
+                                        tool_calls: calls,
+                                        tool_results: vec![],
+                                        extra: envelope,
+                                    }),
+                                }
+                            }
+                            continue;
+                        }
+                        if matches!(
                             payload_type,
                             "function_call_output" | "custom_tool_call_output"
                         ) {
-                            MessageRole::Tool
-                        } else {
+                            let results = codex_extract_payload_tool_results(p);
+                            if !results.is_empty() {
+                                let owned_by_last =
+                                    messages.last().is_some_and(|last| match last.role {
+                                        MessageRole::User | MessageRole::Tool => true,
+                                        MessageRole::Assistant => results.iter().all(|r| {
+                                            r.call_id.as_deref().is_some_and(|id| {
+                                                last.tool_calls
+                                                    .iter()
+                                                    .any(|c| c.id.as_deref() == Some(id))
+                                            })
+                                        }),
+                                        _ => false,
+                                    });
+                                // Tool turns carry the result text as content,
+                                // joined the same way `flatten_content` does.
+                                let joined = results
+                                    .iter()
+                                    .map(|r| r.content.clone())
+                                    .collect::<Vec<_>>()
+                                    .join("\n");
+                                if owned_by_last {
+                                    let last = messages.last_mut().expect("owned_by_last checked");
+                                    last.tool_results.extend(results);
+                                    if last.role == MessageRole::Tool && !joined.trim().is_empty() {
+                                        if last.content.is_empty() {
+                                            last.content = joined;
+                                        } else {
+                                            last.content.push('\n');
+                                            last.content.push_str(&joined);
+                                        }
+                                    }
+                                } else {
+                                    messages.push(CanonicalMessage {
+                                        idx: 0,
+                                        role: MessageRole::Tool,
+                                        content: joined,
+                                        timestamp: ts,
+                                        author: None,
+                                        tool_calls: vec![],
+                                        tool_results: results,
+                                        extra: envelope,
+                                    });
+                                }
+                            }
+                            continue;
+                        }
+
+                        let role = {
                             let role_str = p
                                 .get("role")
                                 .and_then(|v| v.as_str())
@@ -1018,14 +1277,15 @@ impl Codex {
 
                         let content_val = p.get("content");
                         let text = codex_extract_text_content(content_val);
-                        let mut tool_calls = codex_extract_tool_calls(content_val);
-                        tool_calls.extend(codex_extract_payload_tool_calls(p));
-                        let mut tool_results = codex_extract_tool_results(content_val);
-                        tool_results.extend(codex_extract_payload_tool_results(p));
+                        let tool_calls = codex_extract_tool_calls(content_val);
+                        let tool_results = codex_extract_tool_results(content_val);
 
+                        // Empty assistant records are kept as turn anchors so
+                        // following tool records reattach to the right message.
                         if text.trim().is_empty()
                             && tool_calls.is_empty()
                             && tool_results.is_empty()
+                            && role != MessageRole::Assistant
                         {
                             trace!(line = line_num, "skipping empty response_item");
                             continue;
@@ -1314,6 +1574,12 @@ impl Codex {
             "source".into(),
             serde_json::Value::String("codex".to_string()),
         );
+        if let Some(parent_id) = Self::parent_thread_id(&session_id) {
+            metadata.insert(
+                "parent_session_id".into(),
+                serde_json::Value::String(parent_id),
+            );
+        }
 
         debug!(
             session_id,
@@ -1334,6 +1600,25 @@ impl Codex {
             source_path: path.to_path_buf(),
             model_name: None,
         })
+    }
+
+    /// Read Codex's native spawn edge so Codex can also act as a hierarchy
+    /// source for `--with-children` conversions.
+    fn parent_thread_id(session_id: &str) -> Option<String> {
+        let db_path = Self::latest_state_db()?;
+        let conn = Connection::open_with_flags(
+            db_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .ok()?;
+        conn.query_row(
+            "SELECT parent_thread_id FROM thread_spawn_edges WHERE child_thread_id = ?1",
+            rusqlite::params![session_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
     }
 }
 
@@ -1608,24 +1893,34 @@ mod tests {
         };
 
         let events = codex_events_for_message(&msg, "2026-02-09T06:07:08.000Z");
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0]["type"], "response_item");
-        assert_eq!(events[0]["payload"]["type"], "message");
-        let content_blocks = events[0]["payload"]["content"]
+        assert_eq!(events.len(), 5);
+        assert_eq!(events[0]["type"], "event_msg");
+        assert_eq!(events[0]["payload"]["type"], "agent_message");
+        assert_eq!(events[0]["payload"]["phase"], "final_answer");
+        assert_eq!(events[1]["type"], "response_item");
+        assert_eq!(events[1]["payload"]["type"], "message");
+        let content_blocks = events[1]["payload"]["content"]
             .as_array()
             .expect("response_item content should be array");
-        assert!(content_blocks.iter().any(|b| b["type"] == "tool_use"));
-        assert!(content_blocks.iter().any(|b| b["type"] == "tool_result"));
+        assert_eq!(content_blocks.len(), 1);
+        assert_eq!(content_blocks[0]["type"], "output_text");
 
-        assert_eq!(events[1]["type"], "event_msg");
-        assert_eq!(events[1]["payload"]["type"], "token_count");
-        assert_eq!(events[1]["payload"]["info"]["input_tokens"], 11);
-        assert_eq!(events[1]["payload"]["info"]["output_tokens"], 22);
-        assert_eq!(events[1]["payload"]["info"]["total_tokens"], 33);
+        assert_eq!(events[2]["payload"]["type"], "function_call");
+        assert_eq!(events[2]["payload"]["name"], "apply_patch");
+        assert_eq!(events[2]["payload"]["call_id"], "call-1");
+        assert_eq!(events[3]["payload"]["type"], "function_call_output");
+        assert_eq!(events[3]["payload"]["call_id"], "call-1");
+        assert_eq!(events[3]["payload"]["output"], "ok");
+
+        assert_eq!(events[4]["type"], "event_msg");
+        assert_eq!(events[4]["payload"]["type"], "token_count");
+        assert_eq!(events[4]["payload"]["info"]["input_tokens"], 11);
+        assert_eq!(events[4]["payload"]["info"]["output_tokens"], 22);
+        assert_eq!(events[4]["payload"]["info"]["total_tokens"], 33);
     }
 
     #[test]
-    fn user_message_with_tool_payload_is_serialized_as_response_item() {
+    fn user_message_with_tool_payload_is_serialized_as_native_tool_items() {
         let msg = CanonicalMessage {
             idx: 0,
             role: MessageRole::User,
@@ -1646,15 +1941,15 @@ mod tests {
         };
 
         let events = codex_events_for_message(&msg, "2026-02-09T06:07:08.000Z");
-        assert_eq!(events.len(), 1);
+        assert_eq!(events.len(), 2);
         assert_eq!(events[0]["type"], "response_item");
-        assert_eq!(events[0]["payload"]["type"], "message");
-        assert_eq!(events[0]["payload"]["role"], "user");
-        let blocks = events[0]["payload"]["content"]
-            .as_array()
-            .expect("response_item content should be array");
-        assert!(blocks.iter().any(|b| b["type"] == "tool_use"));
-        assert!(blocks.iter().any(|b| b["type"] == "tool_result"));
+        assert_eq!(events[0]["payload"]["type"], "function_call");
+        assert_eq!(events[0]["payload"]["call_id"], "call-7");
+        assert_eq!(events[0]["payload"]["name"], "Read");
+        assert_eq!(events[1]["type"], "response_item");
+        assert_eq!(events[1]["payload"]["type"], "function_call_output");
+        assert_eq!(events[1]["payload"]["call_id"], "call-7");
+        assert_eq!(events[1]["payload"]["output"], "fn main() {}");
     }
 
     #[test]
@@ -2001,7 +2296,7 @@ not json
     }
 
     #[test]
-    fn writer_assistant_without_token_count_produces_one_event() {
+    fn writer_assistant_without_token_count_produces_display_and_context_events() {
         let msg = CanonicalMessage {
             idx: 0,
             role: MessageRole::Assistant,
@@ -2015,10 +2310,12 @@ not json
         let events = codex_events_for_message(&msg, "2026-02-09T06:07:08.000Z");
         assert_eq!(
             events.len(),
-            1,
-            "Assistant without usage should produce one response_item"
+            2,
+            "Assistant text should produce display and response_item events"
         );
-        assert_eq!(events[0]["type"], "response_item");
+        assert_eq!(events[0]["type"], "event_msg");
+        assert_eq!(events[0]["payload"]["type"], "agent_message");
+        assert_eq!(events[1]["type"], "response_item");
     }
 
     // -----------------------------------------------------------------------
@@ -2026,27 +2323,35 @@ not json
     // -----------------------------------------------------------------------
 
     #[test]
-    fn reader_function_call_output_classified_as_tool_role() {
-        // `function_call_output` events have no `role` field. Before the fix they
-        // defaulted to "assistant", placing tool results in an assistant turn which
-        // the Anthropic API rejects. They must now produce a Tool-role message.
-        let content = concat!(
+    fn reader_function_call_output_ownership_rules() {
+        // `function_call_output` events have no `role` field. They attach to the
+        // owning turn: a preceding user turn (Claude-style results) or the
+        // assistant message that issued the matching call. Only unowned results
+        // become standalone Tool-role messages.
+        let owned = concat!(
             r#"{"type":"session_meta","payload":{"id":"sx","cwd":"/tmp/p"}}"#,
             "\n",
             r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"run something"}]}}"#,
             "\n",
             r#"{"type":"response_item","payload":{"type":"function_call_output","call_id":"c1","output":"done"}}"#,
         );
-        let session = read_codex_jsonl(content);
-        let tool_msg = session
-            .messages
-            .iter()
-            .find(|m| !m.tool_results.is_empty())
-            .expect("tool result message should exist");
+        let session = read_codex_jsonl(owned);
+        assert_eq!(session.messages.len(), 1);
+        assert_eq!(session.messages[0].role, MessageRole::User);
+        assert_eq!(session.messages[0].tool_results.len(), 1);
+        assert_eq!(session.messages[0].tool_results[0].content, "done");
+
+        let unowned = concat!(
+            r#"{"type":"session_meta","payload":{"id":"sx","cwd":"/tmp/p"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"function_call_output","call_id":"c1","output":"done"}}"#,
+        );
+        let session = read_codex_jsonl(unowned);
+        assert_eq!(session.messages.len(), 1);
         assert_eq!(
-            tool_msg.role,
+            session.messages[0].role,
             MessageRole::Tool,
-            "function_call_output must produce Tool role, not Assistant"
+            "unowned function_call_output must produce Tool role, not Assistant"
         );
     }
 

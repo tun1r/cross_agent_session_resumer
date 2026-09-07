@@ -1623,13 +1623,13 @@ fn roundtrip_codex_to_piagent() {
 }
 
 /// Regression test for issue #9: Codex sessions with `originator: codex_exec`
-/// produce tool-result-only messages (empty content, non-empty tool_results).
-/// The Pi writer synthesises readable content for these, but without pre-write
-/// normalisation the read-back verification sees a content mismatch
-/// ("wrote 0 bytes, read back 43 bytes").
+/// produce tool-result-only messages. The Codex reader materialises the
+/// result text into `content` (matching the canonical Tool shape), and the
+/// Pi writer synthesises readable content when needed; without pre-write
+/// normalisation the read-back verification sees a content mismatch.
 ///
-/// This test applies the same normalisation the pipeline does (materialising
-/// tool-result text into `content`) before writing, then asserts roundtrip
+/// This test applies the same normalisation the pipeline does (a no-op when
+/// content is already materialised) before writing, then asserts roundtrip
 /// fidelity including the synthesised content.
 #[test]
 fn roundtrip_codex_exec_tool_results_to_piagent() {
@@ -1639,14 +1639,11 @@ fn roundtrip_codex_exec_tool_results_to_piagent() {
 
     let mut session = read_codex_fixture("codex_exec_tool_results", "jsonl");
 
-    // Verify the fixture actually has at least one tool-result-only message
-    // with empty content (this is the scenario that triggers the bug).
-    let has_tool_result_only = session.messages.iter().any(|m| {
-        m.content.trim().is_empty() && m.tool_calls.is_empty() && !m.tool_results.is_empty()
-    });
+    // Verify the fixture actually exercises tool-result messages.
+    let has_tool_results = session.messages.iter().any(|m| !m.tool_results.is_empty());
     assert!(
-        has_tool_result_only,
-        "fixture should contain at least one tool-result-only message with empty content"
+        has_tool_results,
+        "fixture should contain at least one tool-result message"
     );
 
     // Apply the same normalisation the pipeline does before writing.

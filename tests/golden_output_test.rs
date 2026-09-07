@@ -313,8 +313,8 @@ mod cc_golden {
         let line_count = content.lines().count();
         assert_eq!(
             line_count,
-            session.messages.len(),
-            "CC should produce one JSONL line per message"
+            session.messages.len() + 1,
+            "CC should produce one JSONL line per message plus a title record"
         );
     }
 
@@ -335,6 +335,10 @@ mod cc_golden {
         ];
         for (i, line) in content.lines().enumerate() {
             let entry: serde_json::Value = serde_json::from_str(line).unwrap();
+            // The trailing native title record is metadata, not a message.
+            if entry["type"] == "custom-title" {
+                continue;
+            }
             for field in &required {
                 assert!(
                     entry.get(field).is_some(),
@@ -376,6 +380,7 @@ mod cc_golden {
         let lines: Vec<serde_json::Value> = content
             .lines()
             .map(|l| serde_json::from_str(l).unwrap())
+            .filter(|e: &serde_json::Value| e["type"] != "custom-title")
             .collect();
 
         // First entry: parentUuid should be null.
@@ -400,12 +405,15 @@ mod cc_golden {
         let (_, content) = write_cc_session(&simple_session());
         let uuids: Vec<String> = content
             .lines()
+            .filter(|l| {
+                let entry: serde_json::Value = serde_json::from_str(l).unwrap();
+                entry["type"] != "custom-title"
+            })
             .map(|l| {
                 let entry: serde_json::Value = serde_json::from_str(l).unwrap();
                 entry["uuid"].as_str().unwrap().to_string()
             })
             .collect();
-
         let unique: std::collections::HashSet<&str> = uuids.iter().map(|s| s.as_str()).collect();
         assert_eq!(unique.len(), uuids.len(), "CC entry UUIDs should be unique");
     }
@@ -429,6 +437,10 @@ mod cc_golden {
         let (_, content) = write_cc_session(&simple_session());
         for (i, line) in content.lines().enumerate() {
             let entry: serde_json::Value = serde_json::from_str(line).unwrap();
+            // The trailing native title record carries no timestamp.
+            if entry["type"] == "custom-title" {
+                continue;
+            }
             let ts = entry["timestamp"].as_str().unwrap();
             assert!(
                 is_rfc3339(ts),
@@ -584,6 +596,10 @@ mod cc_golden {
         let (_, content) = write_cc_session(&simple_session());
         for (i, line) in content.lines().enumerate() {
             let entry: serde_json::Value = serde_json::from_str(line).unwrap();
+            // The trailing native title record is metadata, not a message.
+            if entry["type"] == "custom-title" {
+                continue;
+            }
             assert_eq!(
                 entry["isSidechain"], false,
                 "CC entry {i} isSidechain should be false"
@@ -596,6 +612,10 @@ mod cc_golden {
         let (_, content) = write_cc_session(&simple_session());
         for (i, line) in content.lines().enumerate() {
             let entry: serde_json::Value = serde_json::from_str(line).unwrap();
+            // The trailing native title record is metadata, not a message.
+            if entry["type"] == "custom-title" {
+                continue;
+            }
             assert_eq!(
                 entry["version"], "casr",
                 "CC entry {i} version should be 'casr'"
@@ -720,13 +740,22 @@ mod codex_golden {
             .map(|l| serde_json::from_str(l).unwrap())
             .collect();
 
-        assert_eq!(lines[2]["type"], "response_item");
-        assert_eq!(lines[2]["payload"]["role"], "assistant");
+        // Native Codex pairs a display event with the model-context record.
+        let display = lines
+            .iter()
+            .find(|e| e["type"] == "event_msg" && e["payload"]["type"] == "agent_message")
+            .expect("assistant turns should emit a native agent_message event");
+        assert_eq!(display["payload"]["phase"], "final_answer");
+
+        let assistant_item = lines
+            .iter()
+            .find(|e| e["type"] == "response_item" && e["payload"]["role"] == "assistant")
+            .expect("assistant turns should serialize as response_item");
 
         // Assistant turns serialize as `output_text` content blocks. Pre-bd-AMP
         // Codex emitted `input_text` for both roles; the conversion was fixed
         // in 6152b9a / f868918 to align with the native Codex schema.
-        let content_blocks = lines[2]["payload"]["content"].as_array().unwrap();
+        let content_blocks = assistant_item["payload"]["content"].as_array().unwrap();
         assert!(!content_blocks.is_empty());
         assert_eq!(content_blocks[0]["type"], "output_text");
         assert_eq!(content_blocks[0]["text"], "Sure, I can help.");
@@ -781,21 +810,15 @@ mod codex_golden {
             .map(|l| serde_json::from_str(l).unwrap())
             .collect();
 
-        // Find the assistant response_item with the tool call.
+        // Native Codex carries tool calls in dedicated `function_call`
+        // records; message content blocks stay text-only.
         let tool_response = lines
             .iter()
-            .find(|e| {
-                e["type"] == "response_item"
-                    && e["payload"]["content"]
-                        .as_array()
-                        .is_some_and(|arr| arr.iter().any(|b| b["type"] == "tool_use"))
-            })
-            .expect("should have a response_item with tool_use");
+            .find(|e| e["type"] == "response_item" && e["payload"]["type"] == "function_call")
+            .expect("should have a function_call record");
 
-        let blocks = tool_response["payload"]["content"].as_array().unwrap();
-        let tu = blocks.iter().find(|b| b["type"] == "tool_use").unwrap();
-        assert_eq!(tu["name"], "Read");
-        assert_eq!(tu["id"], "call-1");
+        assert_eq!(tool_response["payload"]["name"], "Read");
+        assert_eq!(tool_response["payload"]["call_id"], "call-1");
     }
 
     #[test]

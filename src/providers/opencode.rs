@@ -217,7 +217,7 @@ impl OpenCode {
     /// Discover existing OpenCode DB files.
     ///
     /// If env override is set, discovery is constrained to that location.
-    fn find_db_files() -> Vec<PathBuf> {
+    pub(super) fn find_db_files() -> Vec<PathBuf> {
         if let Some(env_db) = Self::env_db_path() {
             return if env_db.is_file() {
                 vec![env_db]
@@ -268,8 +268,19 @@ impl OpenCode {
         Ok(cwd.join(DATA_DIRNAME).join(DB_FILENAME))
     }
 
+    /// Whether any schema generation in this DB contains the session. The
+    /// live database carries several generations side by side (1.x rows
+    /// persist after a 2.x migration, and the native 1.x importer still
+    /// writes `session`/`message`/`part`), so the detected-primary schema
+    /// alone is not enough.
+    pub(super) fn session_exists_any_schema(conn: &Connection, session_id: &str) -> bool {
+        [DbSchema::V2, DbSchema::Legacy, DbSchema::V1]
+            .iter()
+            .any(|schema| Self::session_exists(conn, *schema, session_id))
+    }
+
     /// Build virtual per-session path: `<db-path>/<urlencoded-session-id>`.
-    fn virtual_session_path(db_path: &Path, session_id: &str) -> PathBuf {
+    pub(super) fn virtual_session_path(db_path: &Path, session_id: &str) -> PathBuf {
         let encoded = urlencoding::encode(session_id);
         db_path.join(encoded.as_ref())
     }
@@ -290,7 +301,7 @@ impl OpenCode {
     }
 
     /// Open DB in read-only mode.
-    fn open_db(path: &Path) -> anyhow::Result<Connection> {
+    pub(super) fn open_db(path: &Path) -> anyhow::Result<Connection> {
         let conn = Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -552,7 +563,31 @@ CREATE INDEX IF NOT EXISTS idx_files_session_id ON files (session_id);
         db_path: &Path,
         session_id: &str,
     ) -> anyhow::Result<CanonicalSession> {
-        match Self::detect_schema(conn, db_path)? {
+        let schema = Self::detect_schema(conn, db_path)?;
+        if Self::session_exists(conn, schema, session_id) {
+            return match schema {
+                DbSchema::Legacy => Self::read_legacy_session(conn, db_path, session_id),
+                DbSchema::V1 => Self::read_v1_session(conn, db_path, session_id),
+                DbSchema::V2 => Self::read_v2_session(conn, db_path, session_id),
+            };
+        }
+
+        // The DB mixes schema generations: a row can live outside the
+        // detected-primary one (1.x rows beside 2.x ones in the live DB).
+        // Fall through to whichever generation actually holds the id.
+        for fallback in [DbSchema::V2, DbSchema::V1, DbSchema::Legacy] {
+            if fallback != schema && Self::session_exists(conn, fallback, session_id) {
+                return match fallback {
+                    DbSchema::Legacy => Self::read_legacy_session(conn, db_path, session_id),
+                    DbSchema::V1 => Self::read_v1_session(conn, db_path, session_id),
+                    DbSchema::V2 => Self::read_v2_session(conn, db_path, session_id),
+                };
+            }
+        }
+
+        // Read through the detected schema so the caller gets the usual
+        // "session not found" context naming this DB.
+        match schema {
             DbSchema::Legacy => Self::read_legacy_session(conn, db_path, session_id),
             DbSchema::V1 => Self::read_v1_session(conn, db_path, session_id),
             DbSchema::V2 => Self::read_v2_session(conn, db_path, session_id),
@@ -580,7 +615,7 @@ CREATE INDEX IF NOT EXISTS idx_files_session_id ON files (session_id);
     /// | `shell`                                                  | Tool: the command and its captured output (background shells skipped) |
     /// | `compaction` (`status: completed`)                       | System: the checkpoint summary + recent context    |
     /// | `model-switched`, `agent-switched`, `location-switched`  | skipped (bookkeeping)                              |
-    fn read_v2_session(
+    pub(super) fn read_v2_session(
         conn: &Connection,
         db_path: &Path,
         session_id: &str,
@@ -785,7 +820,7 @@ CREATE INDEX IF NOT EXISTS idx_files_session_id ON files (session_id);
     /// lack some of them; `message.data` / `part.data` are the JSON blobs
     /// OpenCode hydrates its `Message`/`Part` values from (ids and
     /// `session_id`/`message_id` live in dedicated columns, not in `data`).
-    fn read_v1_session(
+    pub(super) fn read_v1_session(
         conn: &Connection,
         db_path: &Path,
         session_id: &str,
@@ -1589,7 +1624,9 @@ struct V1SessionRow {
 /// - `file` → a short `[file: …]` marker so attachments stay visible
 /// - `step-start` / `step-finish` / `snapshot` / `patch` / `agent` and any
 ///   other bookkeeping part carry no conversational content and are skipped
-fn parse_v1_parts(parts: &serde_json::Value) -> (String, Vec<ToolCall>, Vec<ToolResult>) {
+pub(super) fn parse_v1_parts(
+    parts: &serde_json::Value,
+) -> (String, Vec<ToolCall>, Vec<ToolResult>) {
     let mut text_chunks: Vec<String> = Vec::new();
     let mut reasoning_chunks: Vec<String> = Vec::new();
     let mut tool_calls: Vec<ToolCall> = Vec::new();
@@ -1913,7 +1950,7 @@ fn v2_compaction_text(data: &serde_json::Value) -> String {
 /// - `text` → content
 /// - `reasoning` → content only when there is no text
 /// - `tool` → a [`ToolCall`] plus a [`ToolResult`] once completed or errored
-fn parse_v2_assistant_content(
+pub(super) fn parse_v2_assistant_content(
     content: &serde_json::Value,
 ) -> (String, Vec<ToolCall>, Vec<ToolResult>) {
     let mut text_chunks: Vec<String> = Vec::new();

@@ -57,7 +57,7 @@ struct Cli {
 enum Command {
     /// Convert and resume a session from another provider.
     Resume {
-        /// Target provider alias (cc, cod, gmi, agy, cur, cln, aid, amp, opc, gpt).
+        /// Target provider alias (cc, cod, gmi, agy, cur, cln, aid, amp, opc, oc1, oc2, gpt).
         target: String,
         /// Session ID to convert.
         session_id: String,
@@ -102,6 +102,11 @@ enum Command {
         /// workspace and this flag is absent, casr uses the current directory.
         #[arg(long, value_name = "PATH")]
         workspace: Option<std::path::PathBuf>,
+
+        /// Convert the selected session and its provider-native child sessions
+        /// in parent-first order, preserving target hierarchy where supported.
+        #[arg(long)]
+        with_children: bool,
     },
 
     /// List all discoverable sessions across installed providers.
@@ -284,6 +289,7 @@ fn main() -> ExitCode {
             max_tool_output,
             keep_reasoning,
             workspace,
+            with_children,
         } => cmd_resume(
             &target,
             &session_id,
@@ -295,6 +301,7 @@ fn main() -> ExitCode {
             max_tool_output,
             keep_reasoning,
             workspace,
+            with_children,
             cli.json,
         ),
         Command::List {
@@ -376,6 +383,7 @@ fn cmd_resume(
     max_tool_output: usize,
     keep_reasoning: bool,
     workspace: Option<std::path::PathBuf>,
+    with_children: bool,
     json_mode: bool,
 ) -> anyhow::Result<()> {
     let registry = ProviderRegistry::default_registry();
@@ -393,69 +401,89 @@ fn cmd_resume(
         workspace_override: workspace,
     };
 
-    let result = pipeline.convert(target, session_id, opts)?;
+    let results = if with_children {
+        pipeline.convert_tree(target, session_id, opts)?
+    } else {
+        vec![pipeline.convert(target, session_id, opts)?]
+    };
 
     if json_mode {
-        let response = ResumeSuccess {
-            ok: true,
-            source_provider: result.source_provider.clone(),
-            target_provider: result.target_provider.clone(),
-            source_session_id: result.canonical_session.session_id.clone(),
-            target_session_id: result.written.as_ref().map(|w| w.session_id.clone()),
-            written_paths: result
-                .written
-                .as_ref()
-                .map(|w| w.paths.iter().map(|p| p.display().to_string()).collect()),
-            resume_command: result.written.as_ref().map(|w| w.resume_command.clone()),
-            dry_run: result.written.is_none(),
-            warnings: result.warnings.clone(),
-        };
-        println!("{}", serde_json::to_string_pretty(&response)?);
-    } else if let Some(ref written) = result.written {
-        println!(
-            "{} Converted {} session to {}",
-            "✓".green().bold(),
-            result.source_provider.cyan(),
-            result.target_provider.cyan()
-        );
-        println!(
-            "  {} → {}",
-            "Source".dimmed(),
-            result.canonical_session.session_id
-        );
-        println!("  {} → {}", "Target".dimmed(), written.session_id);
-        println!(
-            "  {} → {}",
-            "Messages".dimmed(),
-            result.canonical_session.messages.len()
-        );
-        for path in &written.paths {
-            println!("  {} → {}", "Written".dimmed(), path.display());
+        if results.len() == 1 {
+            let result = &results[0];
+            let response = ResumeSuccess {
+                ok: true,
+                source_provider: result.source_provider.clone(),
+                target_provider: result.target_provider.clone(),
+                source_session_id: result.canonical_session.session_id.clone(),
+                target_session_id: result.written.as_ref().map(|w| w.session_id.clone()),
+                written_paths: result
+                    .written
+                    .as_ref()
+                    .map(|w| w.paths.iter().map(|p| p.display().to_string()).collect()),
+                resume_command: result.written.as_ref().map(|w| w.resume_command.clone()),
+                dry_run: result.written.is_none(),
+                warnings: result.warnings.clone(),
+            };
+            println!("{}", serde_json::to_string_pretty(&response)?);
+        } else {
+            let response: Vec<_> = results
+                .iter()
+                .map(|result| {
+                    serde_json::json!({
+                        "ok": true,
+                        "source_provider": result.source_provider,
+                        "target_provider": result.target_provider,
+                        "source_session_id": result.canonical_session.session_id,
+                        "target_session_id": result.written.as_ref().map(|w| &w.session_id),
+                        "written_paths": result.written.as_ref().map(|w| w.paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>()),
+                        "resume_command": result.written.as_ref().map(|w| &w.resume_command),
+                        "dry_run": result.written.is_none(),
+                        "warnings": result.warnings,
+                    })
+                })
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&response)?);
         }
-        for warning in &result.warnings {
-            println!("  {} {warning}", "⚠".yellow());
-        }
-        println!();
-        println!(
-            "  {} {}",
-            "Resume:".green().bold(),
-            written.resume_command.bold()
-        );
     } else {
-        // Dry run.
-        println!(
-            "{} Would convert {} session to {}",
-            "⊘".cyan().bold(),
-            result.source_provider.cyan(),
-            result.target_provider.cyan()
-        );
-        println!(
-            "  {} → {} messages",
-            "Messages".dimmed(),
-            result.canonical_session.messages.len()
-        );
-        for warning in &result.warnings {
-            println!("  {} {warning}", "⚠".yellow());
+        for result in &results {
+            if let Some(ref written) = result.written {
+                println!(
+                    "{} Converted {} session to {}",
+                    "✓".green().bold(),
+                    result.source_provider.cyan(),
+                    result.target_provider.cyan()
+                );
+                println!(
+                    "  {} → {}",
+                    "Source".dimmed(),
+                    result.canonical_session.session_id
+                );
+                println!("  {} → {}", "Target".dimmed(), written.session_id);
+                println!(
+                    "  {} → {}",
+                    "Messages".dimmed(),
+                    result.canonical_session.messages.len()
+                );
+                for path in &written.paths {
+                    println!("  {} → {}", "Written".dimmed(), path.display());
+                }
+                for warning in &result.warnings {
+                    println!("  {} {warning}", "⚠".yellow());
+                }
+                println!(
+                    "  {} {}",
+                    "Resume:".green().bold(),
+                    written.resume_command.bold()
+                );
+            } else {
+                println!(
+                    "{} Would convert {} session to {} ({} messages)",
+                    "⊘".cyan().bold(),
+                    result.source_provider.cyan(),
+                    result.target_provider.cyan(),
+                    result.canonical_session.messages.len()
+                );
+            }
         }
     }
 
@@ -894,6 +922,8 @@ fn cmd_list(
             "aider" => "Aider",
             "amp" => "Amp",
             "opencode" => "OpenCode",
+            "opencode-v1" => "OpenCode 1.x (native)",
+            "opencode-v2" => "OpenCode 2.x (native)",
             "chatgpt" => "ChatGPT",
             "clawdbot" => "ClawdBot",
             "vibe" => "Vibe",

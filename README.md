@@ -93,6 +93,8 @@ claude --resume <new-session-id>
 | Aider | `aid` | Yes | Yes | `aider --restore-chat-history` |
 | Amp | `amp` | Yes | Yes | `amp threads continue --execute "Continue from @<session-id>"` |
 | OpenCode | `opc` | Yes | Legacy DBs only | `opencode` |
+| OpenCode 1.x (native import) | `oc1` | Yes | Via native `opencode import` | `opencode -s <session-id>` |
+| OpenCode 2.x (native import) | `oc2` | Yes | Via native `opencode2 import` | `opencode2 -s <session-id>` |
 | ChatGPT | `gpt` | Yes | Yes | `open "https://chatgpt.com/c/<session-id>"` |
 | ClawdBot | `cwb` | Yes | Yes | `clawdbot --resume <session-id>` |
 | Vibe | `vib` | Yes | Yes | `vibe --resume <session-id>` |
@@ -106,7 +108,7 @@ Notes:
 - Initial core focus is Claude Code, Codex, and Gemini CLI.
 - Additional providers are implemented through the same `Provider` trait model.
 - Grok Build (xAI's official `grok` CLI) is read and write: casr synthesizes the native session tree (`updates.jsonl` + `summary.json`), which was round-trip verified against a live `grok --resume` (the CLI lists, exports, and resumes casr-written sessions with full conversation context).
-- OpenCode's `opencode.db` comes in three layouts, detected from `sqlite_master`: the legacy plural tables (`sessions`/`messages`; read and write), OpenCode 1.x (`session`/`message`/`part`; read only) and OpenCode 2.x (`session_v2` + the `session_message` entry log; read only). A DB migrated from 1.x to 2.x still carries the stale 1.x tables, so 2.x is probed first. For 2.x, `user`/`assistant`/`system` entries map directly (assistant `tool` parts become tool calls plus results carrying the completed output or the error), `shell` and `synthetic` entries become tool-side turns, completed `compaction` checkpoints become system context, and `model-switched`/`agent-switched`/`location-switched` bookkeeping is skipped. The 1.x and 2.x tables are projections of OpenCode's own event log, so casr never writes into them; convert *out* of OpenCode, or point `OPENCODE_DB_PATH` at a separate legacy-layout DB.
+- OpenCode's `opencode.db` comes in three layouts, detected from `sqlite_master`: the legacy plural tables (`sessions`/`messages`; read and write), OpenCode 1.x (`session`/`message`/`part`; read only) and OpenCode 2.x (`session_v2` + the `session_message` entry log; read only). A DB migrated from 1.x to 2.x still carries the stale 1.x tables, so 2.x is probed first. For 2.x, `user`/`assistant`/`system` entries map directly (assistant `tool` parts become tool calls plus results carrying the completed output or the error), `shell` and `synthetic` entries become tool-side turns, completed `compaction` checkpoints become system context, and `model-switched`/`agent-switched`/`location-switched` bookkeeping is skipped. The 1.x and 2.x tables are projections of OpenCode's own event log, so casr never writes into them directly: the `opc` target only writes separate legacy-layout DBs, while the `oc1`/`oc2` targets convert *into* modern OpenCode through each CLI's own `import` command, so OpenCode creates every row, index and projection itself.
 
 ## Installation
 
@@ -215,6 +217,7 @@ Global flags:
 --trace                   # Trace-level logging (casr=trace)
 --source <alias_or_path>  # Explicit source provider alias or direct session path
 --enrich                  # Add optional synthetic context/orientation messages
+--with-children           # Convert the source session tree parent-first
 ```
 
 ### `casr resume <target> <session-id>`
@@ -230,7 +233,38 @@ casr resume gmi 40f2cb68-fed7-4cee-83de-2b63ba9b7813 --source cc
 casr resume gemini 40f2cb68-fed7-4cee-83de-2b63ba9b7813 --source claude
 casr resume cc <session-id> --force
 casr resume cc <session-id> --json
+
+# Preserve provider-native child-session hierarchy where supported
+casr resume cod <root-session-id> --source opc --with-children
+casr resume cc <root-session-id> --source opc --with-children
+
+# Convert into modern OpenCode through its own native importers
+casr resume oc1 <claude-session-id> --source cc --with-children
+casr resume oc2 <claude-session-id> --source cc --with-children
 ```
+
+`--with-children` enumerates the source provider's descendants, converts the
+root before its children, and maps source IDs to target IDs. Codex targets use
+the native `thread_spawn_edges` index and serialized `subagent.thread_spawn`
+metadata, so child threads are excluded from Codex's normal interactive
+`/resume` picker while remaining addressable through their parent tree. Claude
+Code targets use the native
+`<parent-session>/subagents/agent-<child>.jsonl` layout with sidechain metadata.
+OpenCode targets use the native `parent_id`/`parentID` session relationship, so
+children stay out of root-only listings while remaining reachable through the
+parent tree. Providers without a native child-session representation retain
+their existing flat conversion behavior.
+
+The `oc1` and `oc2` targets never insert rows themselves: each conversion
+builds the provider-native transfer document and runs `opencode import`
+(respectively `opencode2 import --directory <workspace>`), so OpenCode's own
+services create the rows. Conversions emit fresh `ses_` session ids (the
+importers are append-oriented), reshape Claude's streamed assistant entries
+into native turn groupings, attach tool results to their issuing assistant
+turns, and clamp source timestamp regressions so native `(time_created, id)`
+ordering preserves the transcript order. A failed read-back verification
+leaves the imported rows in place rather than deleting from a database
+OpenCode owns.
 
 ### `casr list`
 

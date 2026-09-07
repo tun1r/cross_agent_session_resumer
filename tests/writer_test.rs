@@ -201,7 +201,14 @@ fn writer_cc_output_valid_jsonl() {
 
     let content = std::fs::read_to_string(&written.paths[0]).unwrap();
     let lines: Vec<&str> = content.lines().collect();
-    assert_eq!(lines.len(), 4, "CC should write one line per message");
+    assert_eq!(
+        lines.len(),
+        5,
+        "CC should write messages plus a custom title"
+    );
+    let title: serde_json::Value = serde_json::from_str(lines.last().unwrap()).unwrap();
+    assert_eq!(title["type"], "custom-title");
+    assert_eq!(title["customTitle"], "Fix the login bug");
     for (i, line) in lines.iter().enumerate() {
         if let Err(e) = serde_json::from_str::<serde_json::Value>(line) {
             panic!("CC line {i} not valid JSON: {e}\nContent: {line}");
@@ -222,6 +229,9 @@ fn writer_cc_entries_have_required_fields() {
     let content = std::fs::read_to_string(&written.paths[0]).unwrap();
     for (i, line) in content.lines().enumerate() {
         let entry: serde_json::Value = serde_json::from_str(line).unwrap();
+        if entry["type"] == "custom-title" {
+            continue;
+        }
         for field in [
             "sessionId",
             "type",
@@ -258,6 +268,7 @@ fn writer_cc_parent_uuid_chain() {
     let entries: Vec<serde_json::Value> = content
         .lines()
         .map(|l| serde_json::from_str(l).unwrap())
+        .filter(|entry: &serde_json::Value| entry["type"] != "custom-title")
         .collect();
 
     // First entry: parentUuid is null.
@@ -303,6 +314,42 @@ fn writer_cc_workspace_directory_placement() {
     );
 }
 
+#[test]
+fn writer_cc_child_uses_native_subagent_layout() {
+    let _lock = CC_ENV.lock().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let _env = EnvGuard::set("CLAUDE_HOME", tmp.path());
+
+    let parent = ClaudeCode
+        .write_session(&simple_session(), &WriteOptions { force: false })
+        .unwrap();
+    let child = ClaudeCode
+        .write_session_with_parent(
+            &simple_session(),
+            &WriteOptions { force: false },
+            Some(&parent.session_id),
+        )
+        .unwrap();
+
+    assert!(
+        child.paths[0]
+            .to_string_lossy()
+            .contains("/subagents/agent-")
+    );
+    let first: serde_json::Value = serde_json::from_str(
+        std::fs::read_to_string(&child.paths[0])
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(first["isSidechain"], true);
+    assert_eq!(first["sessionId"], child.session_id);
+    assert_eq!(first["agentId"], child.session_id);
+    assert!(first["promptId"].as_str().is_some());
+}
+
 /// GH #20 regression: a session with no recorded workspace must NOT be
 /// bucketed under `/tmp` (path-encoded `-tmp`). Claude Code resolves
 /// `--resume` by matching the invoking cwd against the session's bucket, so
@@ -342,6 +389,9 @@ fn writer_cc_no_workspace_falls_back_to_cwd_not_tmp() {
     let content = std::fs::read_to_string(path).unwrap();
     for (i, line) in content.lines().enumerate() {
         let entry: serde_json::Value = serde_json::from_str(line).unwrap();
+        if entry["type"] == "custom-title" {
+            continue;
+        }
         assert_eq!(
             entry["cwd"].as_str().unwrap(),
             cwd.display().to_string(),
@@ -363,6 +413,9 @@ fn writer_cc_timestamps_are_rfc3339() {
     let content = std::fs::read_to_string(&written.paths[0]).unwrap();
     for (i, line) in content.lines().enumerate() {
         let entry: serde_json::Value = serde_json::from_str(line).unwrap();
+        if entry["type"] == "custom-title" {
+            continue;
+        }
         let ts_str = match entry["timestamp"].as_str() {
             Some(ts_str) => ts_str,
             None => {
@@ -499,11 +552,11 @@ fn writer_codex_output_valid_jsonl() {
 
     let content = std::fs::read_to_string(&written.paths[0]).unwrap();
     let lines: Vec<&str> = content.lines().collect();
-    // session_meta + 4 messages (2 user event_msg + 2 assistant response_item)
+    // session_meta + 4 message records + 2 assistant display events.
     assert_eq!(
         lines.len(),
-        5,
-        "Codex should write session_meta + 4 message lines"
+        7,
+        "Codex should write session_meta + 4 message records + 2 display events"
     );
     for (i, line) in lines.iter().enumerate() {
         if let Err(e) = serde_json::from_str::<serde_json::Value>(line) {
@@ -618,6 +671,79 @@ fn writer_codex_registers_thread_in_state_db() {
         thread_source.as_deref(),
         Some("user"),
         "threads.thread_source must be 'user'"
+    );
+}
+
+#[test]
+fn writer_codex_registers_native_spawn_edge() {
+    let _lock = CODEX_ENV.lock().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let _env = EnvGuard::set("CODEX_HOME", tmp.path());
+    let db_path = tmp.path().join("state_5.sqlite");
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(CODEX_THREADS_SCHEMA).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE thread_spawn_edges (
+                parent_thread_id TEXT NOT NULL,
+                child_thread_id TEXT NOT NULL PRIMARY KEY,
+                status TEXT NOT NULL
+            )",
+        )
+        .unwrap();
+    }
+
+    let parent = Codex
+        .write_session(&simple_session(), &WriteOptions { force: false })
+        .unwrap();
+    let child = Codex
+        .write_session_with_parent(
+            &simple_session(),
+            &WriteOptions { force: false },
+            Some(&parent.session_id),
+        )
+        .unwrap();
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let edge: (String, String, String) = conn
+        .query_row(
+            "SELECT parent_thread_id, child_thread_id, status FROM thread_spawn_edges
+             WHERE child_thread_id = ?1",
+            [&child.session_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(edge.0, parent.session_id);
+    assert_eq!(edge.1, child.session_id);
+    assert_eq!(edge.2, "closed");
+
+    let (source, thread_source): (String, String) = conn
+        .query_row(
+            "SELECT source, thread_source FROM threads WHERE id = ?1",
+            [&child.session_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(thread_source, "subagent");
+    let source: serde_json::Value = serde_json::from_str(&source).unwrap();
+    assert_eq!(
+        source["subagent"]["thread_spawn"]["parent_thread_id"],
+        parent.session_id
+    );
+    assert_eq!(source["subagent"]["thread_spawn"]["depth"], 1);
+
+    let first_line: serde_json::Value = serde_json::from_str(
+        std::fs::read_to_string(&child.paths[0])
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(first_line["payload"]["thread_source"], "subagent");
+    assert_eq!(
+        first_line["payload"]["source"]["subagent"]["thread_spawn"]["parent_thread_id"],
+        parent.session_id
     );
 }
 
@@ -902,20 +1028,34 @@ fn writer_codex_tool_calls_in_response_content() {
         .map(|l| serde_json::from_str(l).unwrap())
         .collect();
 
-    let response_items: Vec<&serde_json::Value> = lines
+    // Tool calls must be native `function_call` records, not content blocks.
+    let function_calls: Vec<&serde_json::Value> = lines
         .iter()
-        .filter(|l| l["type"] == "response_item")
+        .filter(|l| l["payload"]["type"] == "function_call")
         .collect();
-
-    // First response_item should have tool_use in its content blocks.
-    let first_content = response_items[0]["payload"]["content"]
-        .as_array()
-        .expect("Codex response_item content should be array");
-    let has_tool_use = first_content.iter().any(|b| b["type"] == "tool_use");
-    assert!(
-        has_tool_use,
-        "Codex response_item should contain tool_use block"
+    assert_eq!(
+        function_calls.len(),
+        1,
+        "Codex should emit one function_call record"
     );
+    assert_eq!(function_calls[0]["payload"]["name"], "Read");
+    assert_eq!(
+        function_calls[0]["payload"]["arguments"].as_str(),
+        Some("{\"file_path\":\"src/auth.rs\"}")
+    );
+
+    // Message content must stay text-only so Codex can deserialize it.
+    for item in lines.iter().filter(|l| l["payload"]["type"] == "message") {
+        let blocks = item["payload"]["content"]
+            .as_array()
+            .expect("Codex message content should be array");
+        assert!(
+            blocks
+                .iter()
+                .all(|b| b["type"] == "output_text" || b["type"] == "input_text"),
+            "Codex message content must only carry text blocks"
+        );
+    }
 }
 
 // ===========================================================================

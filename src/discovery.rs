@@ -160,6 +160,17 @@ impl ProviderRegistry {
     /// Find a provider by its CLI alias (e.g. `"cc"`) or slug.
     pub fn find_by_alias(&self, alias: &str) -> Option<&dyn Provider> {
         let normalized = normalize_provider_token(alias);
+        if self.find_by_slug("opencode").is_some() {
+            match normalized.as_str() {
+                "oc1" | "opc1" | "opencode1" | "opencode-v1" => {
+                    return Some(&crate::providers::opencode_native::OPENCODE_V1);
+                }
+                "oc2" | "opc2" | "opencode2" | "opencode-v2" => {
+                    return Some(&crate::providers::opencode_native::OPENCODE_V2);
+                }
+                _ => {}
+            }
+        }
         let canonical = canonical_provider_token(&normalized);
         self.providers
             .iter()

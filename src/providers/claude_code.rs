@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use tracing::{debug, info, trace, warn};
+use walkdir::WalkDir;
 
 use crate::discovery::DetectionResult;
 use crate::model::{
@@ -45,6 +46,67 @@ pub fn project_dir_key(workspace: &Path) -> String {
         .chars()
         .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
         .collect()
+}
+
+/// Recover the Claude parent session from the native subagent path:
+/// `<project>/<parent-session>/subagents/agent-<child>.jsonl`.
+fn claude_parent_session_id(path: &Path) -> Option<String> {
+    let subagents = path.parent()?;
+    if subagents.file_name().and_then(|name| name.to_str()) != Some("subagents") {
+        return None;
+    }
+    subagents
+        .parent()?
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(ToString::to_string)
+}
+
+/// Return the native ID for a Claude child session.
+///
+/// Child transcripts contain their parent's `sessionId`, so the filename is
+/// the only reliable source for the child's own ID.
+fn claude_child_session_id(path: &Path) -> Option<String> {
+    claude_parent_session_id(path)?;
+    let stem = path.file_stem()?.to_str()?;
+    stem.strip_prefix("agent-")
+        .filter(|id| !id.is_empty())
+        .map(ToString::to_string)
+}
+
+fn claude_sessions_in_dir(projects_dir: &Path) -> Vec<(String, PathBuf)> {
+    let mut sessions = Vec::new();
+    let Ok(project_entries) = std::fs::read_dir(projects_dir) else {
+        return sessions;
+    };
+
+    for project_entry in project_entries.flatten() {
+        let project_path = project_entry.path();
+        if !project_path.is_dir() {
+            continue;
+        }
+
+        for session_entry in WalkDir::new(&project_path)
+            .max_depth(3)
+            .into_iter()
+            .filter_map(Result::ok)
+        {
+            let path = session_entry.path();
+            if !path.is_file() || path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let session_id = claude_session_id_hint(path).unwrap_or_else(|| stem.to_string());
+            if !session_id.trim().is_empty() {
+                sessions.push((session_id, path.to_path_buf()));
+            }
+        }
+    }
+
+    sessions
 }
 
 impl ClaudeCode {
@@ -114,45 +176,7 @@ impl Provider for ClaudeCode {
         if !projects_dir.is_dir() {
             return Some(vec![]);
         }
-
-        let mut sessions: Vec<(String, PathBuf)> = Vec::new();
-        let project_entries = match std::fs::read_dir(&projects_dir) {
-            Ok(entries) => entries,
-            Err(_) => return Some(vec![]),
-        };
-
-        for project_entry in project_entries.flatten() {
-            let project_path = project_entry.path();
-            if !project_path.is_dir() {
-                continue;
-            }
-
-            let session_entries = match std::fs::read_dir(&project_path) {
-                Ok(entries) => entries,
-                Err(_) => continue,
-            };
-
-            for session_entry in session_entries.flatten() {
-                let path = session_entry.path();
-                if !path.is_file() {
-                    continue;
-                }
-                if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-                    continue;
-                }
-
-                let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-                    continue;
-                };
-                let session_id = claude_session_id_hint(&path).unwrap_or_else(|| stem.to_string());
-                if session_id.trim().is_empty() {
-                    continue;
-                }
-                sessions.push((session_id, path));
-            }
-        }
-
-        Some(sessions)
+        Some(claude_sessions_in_dir(&projects_dir))
     }
 
     fn owns_session(&self, session_id: &str) -> Option<PathBuf> {
@@ -160,15 +184,10 @@ impl Provider for ClaudeCode {
         if !projects_dir.is_dir() {
             return None;
         }
-        // Scan project directories for a file matching <session-id>.jsonl
-        let target_filename = format!("{session_id}.jsonl");
-        for entry in std::fs::read_dir(&projects_dir).ok()?.flatten() {
-            if entry.file_type().ok()?.is_dir() {
-                let candidate = entry.path().join(&target_filename);
-                if candidate.is_file() {
-                    debug!(path = %candidate.display(), "found Claude Code session");
-                    return Some(candidate);
-                }
+        for (listed_id, path) in claude_sessions_in_dir(&projects_dir) {
+            if listed_id == session_id {
+                debug!(path = %path.display(), "found Claude Code session");
+                return Some(path);
             }
         }
         None
@@ -182,7 +201,9 @@ impl Provider for ClaudeCode {
         let reader = BufReader::new(file);
 
         // Session-level metadata extracted from the first relevant entry.
-        let mut session_id: Option<String> = None;
+        let child_session_id = claude_child_session_id(path);
+        let mut session_id: Option<String> = child_session_id.clone();
+        let mut root_session_id: Option<String> = None;
         let mut workspace: Option<PathBuf> = None;
         let mut git_branch: Option<String> = None;
         let mut version: Option<String> = None;
@@ -230,10 +251,13 @@ impl Provider for ClaudeCode {
             };
 
             // Extract session-level metadata from first entry that has them.
-            if session_id.is_none()
-                && let Some(sid) = entry.get("sessionId").and_then(|v| v.as_str())
-            {
-                session_id = Some(sid.to_string());
+            if let Some(sid) = entry.get("sessionId").and_then(|v| v.as_str()) {
+                if root_session_id.is_none() {
+                    root_session_id = Some(sid.to_string());
+                }
+                if session_id.is_none() {
+                    session_id = Some(sid.to_string());
+                }
             }
             if workspace.is_none()
                 && let Some(cwd) = entry.get("cwd").and_then(|v| v.as_str())
@@ -407,11 +431,39 @@ impl Provider for ClaudeCode {
             .or(away_summary)
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
+        let has_native_name = native_name.is_some();
         if let Some(name) = native_name {
             metadata.insert(
                 crate::model::NATIVE_NAME_META_KEY.into(),
                 serde_json::Value::String(name),
             );
+        }
+        if let Some(parent_id) = claude_parent_session_id(path) {
+            metadata.insert(
+                "parent_session_id".into(),
+                serde_json::Value::String(parent_id),
+            );
+            metadata.insert("is_sidechain".into(), serde_json::Value::Bool(true));
+            if let Some(root_id) = root_session_id {
+                metadata.insert("root_session_id".into(), serde_json::Value::String(root_id));
+            }
+            // Claude Code child transcripts carry no title of their own; the
+            // delegation description lives in the parent's `Agent` tool call.
+            // Record the first user turn (the task prompt) under the native
+            // name key so tree conversions can title the child after it —
+            // it is the only parent-side label available per transcript.
+            if !has_native_name
+                && let Some(first_user) = messages
+                    .iter()
+                    .find(|m| m.role == MessageRole::User)
+                    .map(|m| truncate_title(&m.content, 80))
+                    .filter(|t| !t.is_empty())
+            {
+                metadata.insert(
+                    crate::model::NATIVE_NAME_META_KEY.into(),
+                    serde_json::Value::String(first_user),
+                );
+            }
         }
 
         debug!(
@@ -440,6 +492,15 @@ impl Provider for ClaudeCode {
         session: &CanonicalSession,
         opts: &WriteOptions,
     ) -> anyhow::Result<WrittenSession> {
+        self.write_session_with_parent(session, opts, None)
+    }
+
+    fn write_session_with_parent(
+        &self,
+        session: &CanonicalSession,
+        opts: &WriteOptions,
+        parent_session_id: Option<&str>,
+    ) -> anyhow::Result<WrittenSession> {
         let target_session_id = uuid::Uuid::new_v4().to_string();
         let now = chrono::Utc::now();
         let now_iso = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
@@ -454,7 +515,13 @@ impl Provider for ClaudeCode {
         let projects_dir = Self::projects_dir()
             .ok_or_else(|| anyhow::anyhow!("cannot determine Claude Code projects directory"))?;
         let target_dir = projects_dir.join(&dir_key);
-        let target_path = target_dir.join(format!("{target_session_id}.jsonl"));
+        let target_path = match parent_session_id {
+            Some(parent_id) => target_dir
+                .join(parent_id)
+                .join("subagents")
+                .join(format!("agent-{target_session_id}.jsonl")),
+            None => target_dir.join(format!("{target_session_id}.jsonl")),
+        };
 
         debug!(
             target_session_id,
@@ -465,6 +532,7 @@ impl Provider for ClaudeCode {
         // Build JSONL content: one line per message.
         let mut lines: Vec<String> = Vec::with_capacity(session.messages.len());
         let mut prev_uuid: Option<String> = None;
+        let prompt_id = parent_session_id.map(|_| uuid::Uuid::new_v4().to_string());
 
         for msg in &session.messages {
             let entry_uuid = uuid::Uuid::new_v4().to_string();
@@ -487,7 +555,7 @@ impl Provider for ClaudeCode {
             };
             let entry = serde_json::json!({
                 "parentUuid": parent_uuid_val,
-                "isSidechain": false,
+                "isSidechain": parent_session_id.is_some(),
                 "userType": "external",
                 "cwd": workspace_str.to_string_lossy(),
                 "sessionId": target_session_id,
@@ -497,10 +565,25 @@ impl Provider for ClaudeCode {
                 "message": inner_msg,
                 "uuid": entry_uuid,
                 "timestamp": msg_ts,
+                "promptId": prompt_id,
+                "agentId": parent_session_id.map(|_| target_session_id.clone()),
             });
 
             lines.push(serde_json::to_string(&entry)?);
             prev_uuid = Some(entry_uuid);
+        }
+
+        if let Some(title) = session
+            .title
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+        {
+            lines.push(serde_json::to_string(&serde_json::json!({
+                "type": "custom-title",
+                "customTitle": title,
+                "sessionId": target_session_id,
+            }))?);
         }
 
         // Terminate the final line with a newline. Claude Code appends new turns
@@ -744,6 +827,10 @@ fn is_harness_chrome(content: &str) -> bool {
 }
 
 fn claude_session_id_hint(path: &Path) -> Option<String> {
+    if let Some(child_id) = claude_child_session_id(path) {
+        return Some(child_id);
+    }
+
     let file = std::fs::File::open(path).ok()?;
     let reader = BufReader::new(file);
     for line in reader.lines().map_while(Result::ok).take(8) {
@@ -799,7 +886,10 @@ fn claude_extract_text_content(content: Option<&serde_json::Value>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_inner_message, build_message_content, claude_entry_type, project_dir_key};
+    use super::{
+        build_inner_message, build_message_content, claude_entry_type, claude_sessions_in_dir,
+        project_dir_key,
+    };
     use crate::model::{CanonicalMessage, MessageRole, ToolCall, ToolResult};
     use std::path::Path;
 
@@ -1177,6 +1267,48 @@ not json at all
     fn reader_empty_file_returns_empty_session() {
         let session = read_cc_jsonl("");
         assert_eq!(session.messages.len(), 0);
+    }
+
+    #[test]
+    fn reader_child_uses_filename_id_and_preserves_root_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let child_dir = temp.path().join("root-session").join("subagents");
+        std::fs::create_dir_all(&child_dir).unwrap();
+        let child_path = child_dir.join("agent-child-session.jsonl");
+        std::fs::write(
+            &child_path,
+            r#"{"type":"user","sessionId":"root-session","message":{"role":"user","content":"child work"}}"#,
+        )
+        .unwrap();
+
+        let session = ClaudeCode.read_session(&child_path).unwrap();
+        assert_eq!(session.session_id, "child-session");
+        assert_eq!(session.metadata["parent_session_id"], "root-session");
+        assert_eq!(session.metadata["root_session_id"], "root-session");
+    }
+
+    #[test]
+    fn discovery_lists_root_and_child_with_distinct_ids() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        let root = project.join("root-session.jsonl");
+        let child_dir = project.join("root-session").join("subagents");
+        std::fs::create_dir_all(&child_dir).unwrap();
+        std::fs::write(
+            &root,
+            r#"{"type":"user","sessionId":"root-session","message":{"role":"user","content":"root"}}"#,
+        )
+        .unwrap();
+        let child = child_dir.join("agent-child-session.jsonl");
+        std::fs::write(
+            &child,
+            r#"{"type":"user","sessionId":"root-session","message":{"role":"user","content":"child"}}"#,
+        )
+        .unwrap();
+
+        let listed = claude_sessions_in_dir(temp.path());
+        assert!(listed.contains(&("root-session".to_string(), root)));
+        assert!(listed.contains(&("child-session".to_string(), child)));
     }
 
     // -----------------------------------------------------------------------

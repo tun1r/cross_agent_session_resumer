@@ -20,6 +20,7 @@ pub mod grok;
 pub mod kiro;
 pub mod openclaw;
 pub mod opencode;
+pub mod opencode_native;
 pub mod pi_agent;
 pub mod vibe;
 
@@ -77,12 +78,31 @@ pub trait Provider: Send + Sync {
     /// Read a session from its native format into canonical IR.
     fn read_session(&self, path: &Path) -> anyhow::Result<CanonicalSession>;
 
+    /// Normalize native message boundaries before writing and verifying.
+    /// Some targets store a tool call and its result in the same assistant turn.
+    fn prepare_session(&self, _session: &mut CanonicalSession) -> anyhow::Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+
     /// Write a canonical session into this provider's native format.
     fn write_session(
         &self,
         session: &CanonicalSession,
         opts: &WriteOptions,
     ) -> anyhow::Result<WrittenSession>;
+
+    /// Write a session and, when the target provider supports it, attach it to
+    /// an already-written target parent session. The default preserves the
+    /// existing flat-provider behavior.
+    fn write_session_with_parent(
+        &self,
+        session: &CanonicalSession,
+        opts: &WriteOptions,
+        parent_session_id: Option<&str>,
+    ) -> anyhow::Result<WrittenSession> {
+        let _ = parent_session_id;
+        self.write_session(session, opts)
+    }
 
     /// Build the shell command to resume a session with this provider.
     fn resume_command(&self, session_id: &str) -> String;
