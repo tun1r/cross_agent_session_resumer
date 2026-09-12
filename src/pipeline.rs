@@ -951,6 +951,10 @@ fn readback_mismatch_detail(
             ));
         }
         if orig.content != rb.content {
+            if std::env::var("CASR_DEBUG_READBACK").is_ok() {
+                let _ = std::fs::write(format!("/tmp/casr-mismatch-{i}-orig.txt"), &orig.content);
+                let _ = std::fs::write(format!("/tmp/casr-mismatch-{i}-readback.txt"), &rb.content);
+            }
             return Some(format!(
                 "message content mismatch at idx {i}: wrote {} bytes, read back {} bytes",
                 orig.content.len(),

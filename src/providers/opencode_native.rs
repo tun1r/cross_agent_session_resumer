@@ -10,9 +10,10 @@
 //! - **1.x** (`alias: oc1`) shells out to `opencode import <file>` run from
 //!   the target workspace. The importer overrides `projectID`/`directory`/
 //!   `path` from its invocation, grafting the session into the right project.
-//! - **2.x** (`alias: oc2`) shells out to `opencode2 import <file>
-//!   --directory <workspace>`, which resolves the project and writes through
-//!   OpenCode 2's own services.
+//! - **2.x** (`alias: oc2`) shells out to `opencode2 session import <file>
+//!   --directory <workspace>` (falling back to the top-level `import` on early
+//!   2.0 betas), which resolves the project and writes through OpenCode 2's own
+//!   services.
 //!
 //! Both write fresh `ses_`-prefixed session ids per conversion: the native
 //! importers are append-oriented (re-importing an existing id keeps the old
@@ -334,6 +335,36 @@ pub(super) fn prepare_native_session(session: &mut CanonicalSession) -> Vec<Stri
         ));
     }
 
+    // 4b. Align each assistant turn's tool_results order with its tool_calls
+    //     order. The native writer emits one tool part per call (in tool_calls
+    //     order) and the reader rebuilds `content` by joining results in that
+    //     same stored order — but source transcripts can carry results in
+    //     completion order rather than call order (Claude Code returns parallel
+    //     tool results as they finish). Without this, a result-only turn's
+    //     materialized content is a reordering of the read-back content: same
+    //     bytes, different sequence, so verification fails. Reordering the
+    //     results to follow their calls makes write ↔ read-back agree exactly.
+    //     Results with no matching call (rare; they stay on user-side turns for
+    //     Claude sources) keep their relative order at the end.
+    for message in &mut session.messages {
+        if message.role != MessageRole::Assistant || message.tool_calls.is_empty() {
+            continue;
+        }
+        let mut remaining = std::mem::take(&mut message.tool_results);
+        let mut reordered: Vec<ToolResult> = Vec::with_capacity(remaining.len());
+        for call in &message.tool_calls {
+            if let Some(id) = &call.id
+                && let Some(pos) = remaining
+                    .iter()
+                    .position(|result| result.call_id.as_deref() == Some(id))
+            {
+                reordered.push(remaining.remove(pos));
+            }
+        }
+        reordered.extend(remaining);
+        message.tool_results = reordered;
+    }
+
     // 5. Materialize the readers' derived content for result-only turns.
     let mut materialized = 0usize;
     for message in &mut session.messages {
@@ -615,7 +646,14 @@ pub(super) fn build_v2_transfer(
                     "type": "tool",
                     "id": call.id.clone().unwrap_or_else(|| new_id("call")),
                     "name": call.name,
-                    "executed": result.is_some(),
+                    // OpenCode 2 reads `executed: true` as "the provider ran this
+                    // tool server-side" and inlines the result into the assistant
+                    // message, which OpenAI-Chat-protocol providers reject with
+                    // "assistant messages only support text, reasoning, and
+                    // tool-call content". A converted tool was run locally by the
+                    // source agent, so it is always `false` — the value native
+                    // OpenCode sessions store for locally-executed tools.
+                    "executed": false,
                     "state": state,
                     "time": {
                         "created": timestamp,
@@ -663,6 +701,28 @@ fn v2_project_id(workspace: &Path) -> Option<String> {
         }
     }
     None
+}
+
+/// Whether the OpenCode 2.x CLI exposes its importer as `session import`.
+///
+/// OpenCode 2.0.x releases moved the importer under `session import`; the early
+/// 2.0 betas this writer was first built against had it at the top level.
+/// Probing `opencode2 session import --help` (exit 0 == the subcommand exists)
+/// keeps conversions working across that drift without pinning a version. The
+/// answer is cached per process: the V2 program name is fixed, and the probe
+/// spawns the CLI once no matter how many sessions a tree conversion imports.
+fn v2_uses_session_import() -> bool {
+    use std::sync::OnceLock;
+    static PROBE: OnceLock<bool> = OnceLock::new();
+    *PROBE.get_or_init(|| {
+        std::process::Command::new(NativeVariant::V2.cli_program())
+            .args(["session", "import", "--help"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    })
 }
 
 impl Provider for OpenCodeNative {
@@ -787,7 +847,16 @@ impl Provider for OpenCodeNative {
         );
 
         let mut command = std::process::Command::new(program);
-        command.arg("import").arg(&temp_path);
+        // OpenCode 2.x moved the importer from a top-level `import` (the early
+        // 2.0 betas this writer was built against) to `session import` (2.0.x
+        // releases). Probe for the modern shape so conversions survive the
+        // version drift; 1.x keeps its top-level `import`.
+        if variant == NativeVariant::V2 && v2_uses_session_import() {
+            command.arg("session").arg("import");
+        } else {
+            command.arg("import");
+        }
+        command.arg(&temp_path);
         if variant == NativeVariant::V2 {
             command.arg("--directory").arg(&directory);
         }
@@ -982,6 +1051,45 @@ mod tests {
     }
 
     #[test]
+    fn prepare_orders_results_to_match_calls() {
+        // Parallel tool calls can return results in completion order, not call
+        // order. The writer emits tool parts per call and the reader rebuilds
+        // content in that stored order, so a result-only turn's materialized
+        // content must follow the calls — otherwise read-back verification sees
+        // the same bytes in a different sequence and fails.
+        let mut session = sample_session();
+        session.messages[1].tool_calls.push(ToolCall {
+            id: Some("toolu_02".to_string()),
+            name: "WebFetch".to_string(),
+            arguments: serde_json::json!({ "url": "https://example.com/b" }),
+        });
+        // Results arrive out of order: toolu_02 finished before toolu_01.
+        session.messages[2].tool_results.push(ToolResult {
+            call_id: Some("toolu_02".to_string()),
+            content: "second call output".to_string(),
+            is_error: false,
+        });
+        let mut swapped = session.messages[2].tool_results.clone();
+        swapped.swap(0, 1);
+        session.messages[2].tool_results = swapped;
+
+        prepare_native_session(&mut session);
+
+        let merged = &session.messages[1];
+        assert_eq!(merged.tool_calls.len(), 2);
+        assert_eq!(
+            merged
+                .tool_results
+                .iter()
+                .map(|r| r.call_id.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("toolu_01"), Some("toolu_02")],
+            "results must be reordered to follow their calls"
+        );
+        assert_eq!(merged.content, "fn main() {}\nsecond call output");
+    }
+
+    #[test]
     fn prepare_anchors_assistant_first_transcripts() {
         let mut session = sample_session();
         session.messages.remove(0);
@@ -1064,7 +1172,10 @@ mod tests {
         assert_eq!(content.len(), 1);
         assert_eq!(content[0]["type"], "tool");
         assert_eq!(content[0]["id"], "toolu_01");
-        assert_eq!(content[0]["executed"], true);
+        // Converted tools were executed locally by the source agent, never
+        // provider-side; `true` here would make OpenCode inline the result
+        // into the assistant message and break OpenAI-Chat providers.
+        assert_eq!(content[0]["executed"], false);
         assert_eq!(content[0]["state"]["status"], "completed");
         assert_eq!(content[0]["state"]["content"][0]["text"], "fn main() {}");
 
